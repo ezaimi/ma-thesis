@@ -4,6 +4,7 @@ import json
 import re
 import socket
 import sys
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -83,6 +84,15 @@ DEFAULT_PYTHON_VERSION, DEFAULT_PYTHON_VERSION_ERROR = validate_python_version_c
     _RAG_REPAIR_CONFIG.get("runtime", {}).get("python_version")
 )
 
+_PYPI_RATE_LIMIT_CONFIG = _RAG_REPAIR_CONFIG.get("pypi_client", {}).get("rate_limit", {}) or {}
+DEFAULT_MIN_REQUEST_INTERVAL_SECONDS = float(
+    _PYPI_RATE_LIMIT_CONFIG.get("min_request_interval_seconds", 0.5)
+)
+DEFAULT_MAX_RETRIES_ON_429 = int(_PYPI_RATE_LIMIT_CONFIG.get("max_retries_on_429", 1))
+DEFAULT_MAX_RETRY_AFTER_SECONDS = float(
+    _PYPI_RATE_LIMIT_CONFIG.get("max_retry_after_seconds", 5.0)
+)
+
 
 def resolve_distribution_name(import_name: str) -> Optional[str]:
     return _PACKAGE_MAPPING.get(import_name)
@@ -108,11 +118,70 @@ def clear_pypi_cache() -> None:
     _pypi_response_cache.clear()
 
 
+# --- Rate limiting -----------------------------------------------------------
+# Single-process, in-memory throttle only - no persistence across runs, no
+# distributed coordination. Applies to real (uncached) requests only:
+# fetch_pypi_project() checks the cache before any of this is reached, so a
+# cache hit never waits and is never counted as a request.
+
+_last_pypi_request_monotonic: Optional[float] = None
+
+
+def reset_pypi_rate_limiter() -> None:
+    """Reset the in-memory rate-limit clock, for the same reason
+    clear_pypi_cache() exists: so one test's throttling state never leaks
+    into the next."""
+    global _last_pypi_request_monotonic
+    _last_pypi_request_monotonic = None
+
+
+def _throttle_before_request(min_interval_seconds: float) -> None:
+    """Block, if needed, so at least `min_interval_seconds` has elapsed
+    since the previous real PyPI request this process made. Called once per
+    fetch_pypi_project() call, before the first HTTP attempt - not before
+    each internal HTTP-429 retry, which already waits on its own
+    Retry-After-derived delay. `min_interval_seconds <= 0` disables this
+    entirely. Reads time.monotonic()/time.sleep() through the `time` module
+    attribute (not imported names) so tests can monkeypatch
+    pypi_retriever.time.sleep without ever waiting for real."""
+    global _last_pypi_request_monotonic
+
+    now = time.monotonic()
+
+    if min_interval_seconds > 0 and _last_pypi_request_monotonic is not None:
+        remaining = min_interval_seconds - (now - _last_pypi_request_monotonic)
+        if remaining > 0:
+            time.sleep(remaining)
+            now = time.monotonic()
+
+    _last_pypi_request_monotonic = now
+
+
+def _parse_retry_after_seconds(raw_value: Optional[str]) -> Optional[float]:
+    """Parse an HTTP `Retry-After` header as a plain, non-negative number of
+    seconds only - the HTTP-date form is not supported. Never raises: a
+    missing, non-numeric, or negative value returns None, so a malformed
+    header always fails safe into "no usable wait time" instead of crashing
+    or sleeping for a guessed duration."""
+    if not raw_value:
+        return None
+    try:
+        seconds = float(str(raw_value).strip())
+    except (TypeError, ValueError):
+        return None
+    if seconds < 0:
+        return None
+    return seconds
+
+
 def fetch_pypi_project(
     distribution_name: str,
     timeout: float = DEFAULT_FETCH_TIMEOUT_SECONDS,
     urlopen: Optional[Any] = None,
     use_cache: bool = True,
+    min_request_interval: Optional[float] = None,
+    max_retries_on_429: Optional[int] = None,
+    max_retry_after_seconds: Optional[float] = None,
 ) -> Tuple[str, Optional[Dict[str, Any]]]:
     """Fetch one distribution's file listing from the official PyPI JSON
     Simple API (PEP 691), https://pypi.org/simple/{name}/ - never any other
@@ -124,14 +193,32 @@ def fetch_pypi_project(
     time so monkeypatching urllib.request.urlopen also still works).
 
     Returns (status, data): status is "ok" (data is the parsed JSON dict),
-    "package_not_found", "network_error", or "invalid_response" (data is
-    None in the latter three cases). Distinguishes HTTP, connection,
-    timeout, and parsing failures rather than collapsing them into one
-    generic error, per day-1-rag-repair-agent-plan.md Step 4.
+    "package_not_found", "network_error", or "invalid_response". `data` is
+    None for "package_not_found" and "invalid_response", and normally None
+    for "network_error" too - except when the underlying cause was an HTTP
+    429, in which case `data` is a small dict `{"reason": "rate_limited",
+    "retry_after_seconds": float | None, "retries_attempted": int,
+    "max_retries": int}` so a caller (retrieve()) can report a specific,
+    honest reason without this function inventing a new top-level status.
+    Distinguishes HTTP, connection, timeout, and parsing failures rather
+    than collapsing them into one generic error, per
+    day-1-rag-repair-agent-plan.md Step 4.
 
     Within-process results are cached by normalized distribution name
     (`use_cache=True`, the default) so a batch run never issues two
-    requests for the same project - see docs/rag-design.md §9.3.
+    requests for the same project - see docs/rag-design.md §2.4. A cache
+    hit returns immediately, before any throttling or 429 handling below.
+
+    Rate limiting (docs/rag-design.md §2.4, config/rag_repair.yaml
+    `pypi_client.rate_limit`): before the first real HTTP attempt, waits
+    (if needed) so at least `min_request_interval` seconds have passed
+    since this process's last real PyPI request. On HTTP 429, retries at
+    most `max_retries_on_429` times, only when the response's Retry-After
+    header parses as a plain number of seconds no larger than
+    `max_retry_after_seconds` - never an unbounded wait, never a guessed
+    duration. All three rate-limit parameters default to the values loaded
+    from config/rag_repair.yaml at import time when left as None; tests
+    override them explicitly for determinism.
     """
     if use_cache and distribution_name in _pypi_response_cache:
         return _pypi_response_cache[distribution_name]
@@ -142,30 +229,73 @@ def fetch_pypi_project(
             _pypi_response_cache[distribution_name] = result
         return result
 
-    url = f"{PYPI_SIMPLE_BASE}/{distribution_name}/"
-    request = urllib.request.Request(
-        url,
-        headers={
-            "Accept": PYPI_SIMPLE_ACCEPT_HEADER,
-            "User-Agent": USER_AGENT,
-        },
+    interval = DEFAULT_MIN_REQUEST_INTERVAL_SECONDS if min_request_interval is None else min_request_interval
+    retries_allowed = DEFAULT_MAX_RETRIES_ON_429 if max_retries_on_429 is None else max_retries_on_429
+    retry_after_cap = (
+        DEFAULT_MAX_RETRY_AFTER_SECONDS if max_retry_after_seconds is None else max_retry_after_seconds
     )
 
+    url = f"{PYPI_SIMPLE_BASE}/{distribution_name}/"
+    headers = {
+        "Accept": PYPI_SIMPLE_ACCEPT_HEADER,
+        "User-Agent": USER_AGENT,
+    }
     opener = urlopen if urlopen is not None else urllib.request.urlopen
 
-    try:
-        with opener(request, timeout=timeout) as response:
-            raw_body = response.read()
-    except urllib.error.HTTPError as exc:
-        result = ("package_not_found", None) if exc.code == 404 else ("network_error", None)
-        if use_cache:
-            _pypi_response_cache[distribution_name] = result
-        return result
-    except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError):
-        result = ("network_error", None)
-        if use_cache:
-            _pypi_response_cache[distribution_name] = result
-        return result
+    _throttle_before_request(interval)
+
+    attempt = 0
+    while True:
+        request = urllib.request.Request(url, headers=headers)
+
+        try:
+            with opener(request, timeout=timeout) as response:
+                raw_body = response.read()
+            break
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                result = ("package_not_found", None)
+                if use_cache:
+                    _pypi_response_cache[distribution_name] = result
+                return result
+
+            if exc.code == 429:
+                exc_headers = getattr(exc, "headers", None)
+                retry_after = _parse_retry_after_seconds(
+                    exc_headers.get("Retry-After") if exc_headers is not None else None
+                )
+                can_retry = (
+                    attempt < retries_allowed
+                    and retry_after is not None
+                    and retry_after <= retry_after_cap
+                )
+                if can_retry:
+                    time.sleep(retry_after)
+                    attempt += 1
+                    continue
+
+                result = (
+                    "network_error",
+                    {
+                        "reason": "rate_limited",
+                        "retry_after_seconds": retry_after,
+                        "retries_attempted": attempt,
+                        "max_retries": retries_allowed,
+                    },
+                )
+                if use_cache:
+                    _pypi_response_cache[distribution_name] = result
+                return result
+
+            result = ("network_error", None)
+            if use_cache:
+                _pypi_response_cache[distribution_name] = result
+            return result
+        except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError):
+            result = ("network_error", None)
+            if use_cache:
+                _pypi_response_cache[distribution_name] = result
+            return result
 
     try:
         data = json.loads(raw_body)
@@ -518,7 +648,20 @@ def retrieve(
     if fetch_status == "network_error":
         result["status"] = "network_error"
         result["source_endpoint"] = endpoint
-        result["error"] = "Could not reach PyPI (timeout, DNS, or connection failure)."
+        if isinstance(data, dict) and data.get("reason") == "rate_limited":
+            retry_after = data.get("retry_after_seconds")
+            retry_after_text = (
+                f"retry_after={retry_after}s" if retry_after is not None else "no usable Retry-After value"
+            )
+            message = (
+                "PyPI rate-limited this request (HTTP 429); "
+                f"{retry_after_text} (retries_attempted={data.get('retries_attempted')}/"
+                f"{data.get('max_retries')})."
+            )
+            result["error"] = message
+            result["warnings"] = [message]
+        else:
+            result["error"] = "Could not reach PyPI (timeout, DNS, or connection failure)."
         return result
 
     if fetch_status == "invalid_response":

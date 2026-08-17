@@ -302,16 +302,55 @@ confirmed. No change was made to fix this in this step - the recommended policy 
 apply to `wrong_version`, where every surviving candidate has already been proven via the
 compatibility-evidence intersection, independent of `python_compatibility`).
 
-### 2.4 Caching (i4)
+### 2.4 Caching and rate limiting (i4)
 
 `fetch_pypi_project()` keeps a simple in-memory, process-lifetime cache keyed by normalized
 distribution name, so one retrieval run never issues two requests for the same project - relevant
 given several `failing_module` values (e.g. `sklearn`, `pkg_resources`) recur dozens of times
-across the 214-row dataset. This is deliberately minimal: no persistence across runs, no TTL, no
-retry/backoff, no rate limiting. Retry-on-transient-failure remains explicitly optional per §9.3
-("the production implementation in i4 *may* use a bounded retry policy") and is not implemented;
-rate limiting is not implemented either. Both remain open, non-blocking i4 items - see the "later
-in i4" list in the audit report accompanying this commit.
+across the 214-row dataset. This is deliberately minimal: no persistence across runs, no TTL. A
+cache hit never waits and is never counted as a request by the rate limiting described below.
+
+**Rate limiting**, closing issue #42 checklist item 10's remaining half: before each real
+(uncached) request, `fetch_pypi_project()` waits, if needed, so at least
+`config/rag_repair.yaml`'s `pypi_client.rate_limit.min_request_interval_seconds` (default `0.5`,
+overridable to `0` to disable throttling entirely) has elapsed since this process's last real PyPI
+request. This is a single, process-local, in-memory clock - not persistent, not distributed across
+parallel workers.
+
+HTTP 429 is recognized explicitly rather than folding into the generic connection-failure path: if
+the response's `Retry-After` header parses as a plain, non-negative number of seconds (the
+HTTP-date form is not supported, and a malformed value is always treated the same as no
+`Retry-After` at all - never guessed, never crashed on) and does not exceed
+`pypi_client.rate_limit.max_retry_after_seconds` (default `5.0`), `fetch_pypi_project()` performs
+at most `pypi_client.rate_limit.max_retries_on_429` (default `1`) bounded retries, sleeping exactly
+the declared `Retry-After` before each. This is never an unbounded retry loop; exhausting the
+budget - or a 429 with no usable `Retry-After` - ends the request. **The existing retrieval-status
+contract is unchanged**: a 429 still surfaces as `status: "network_error"`, exactly as any other
+connection failure did before this change (`retrieve()`'s `set(result.keys())` schema is untouched -
+see §2.3's output-schema table, still the same fourteen fields). The only difference is *content*:
+when the cause was a 429, `fetch_pypi_project()`'s internal `(status, data)` pair carries a small
+`{"reason": "rate_limited", "retry_after_seconds", "retries_attempted", "max_retries"}` dict instead
+of `None`, and `retrieve()` turns that into a specific, honest sentence in the existing `error` and
+`warnings` fields (both already part of the schema) rather than inventing a new top-level field or
+status value.
+
+Retry-on-transient-failure for *non*-429 failures remains explicitly optional per §9.3 ("the
+production implementation in i4 *may* use a bounded retry policy") and is still not implemented;
+persistent caching, distributed rate limiting, and adaptive/exponential backoff also remain
+deliberately deferred - none of the three is required by issue #42, and each adds coordination
+complexity this single-process batch pipeline does not currently need.
+
+**Test coverage.** `tests/test_pypi_retriever.py` now also runs the real `retrieve()` entry point
+(not just `resolve_distribution_name()`) against all five names from the L5 proof of concept -
+`sklearn`, `umap`, `pkg_resources`, `scipy`, `dms_variants` - each with a mocked PyPI response,
+confirming mapping resolution, the normalized endpoint, candidate filtering, and the full output
+schema for the two names (`umap`, `pkg_resources`) that were previously only asserted against the
+mapping table. This closes the *offline* half of issue #42 checklist item 9. It is not the literal
+live re-run the checklist item also asks for: comparing real PyPI responses for these five names
+against the L5 PoC's own recorded findings (§9-§12 below, left unchanged as a historical record)
+is performed separately, against the real network, as part of the upcoming manual pilot - see the
+accompanying commit's final report for exactly what that pilot covers and what it does not yet
+confirm.
 
 
 

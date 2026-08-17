@@ -22,10 +22,18 @@ from rag_repair_agent import (
 
 
 @pytest.fixture(autouse=True)
-def _reset_pypi_cache():
+def _reset_pypi_cache(monkeypatch):
+    """Also resets the PyPI rate-limit clock and no-ops time.sleep, so an
+    end-to-end test that goes through the real retrieve() -> fetch_pypi_project()
+    path (see mock_pypi() below) never actually blocks on the configured
+    min_request_interval_seconds throttle - mirrors
+    tests/test_pypi_retriever.py's identical fixture."""
     pypi_retriever.clear_pypi_cache()
+    pypi_retriever.reset_pypi_rate_limiter()
+    monkeypatch.setattr(pypi_retriever.time, "sleep", lambda seconds: None)
     yield
     pypi_retriever.clear_pypi_cache()
+    pypi_retriever.reset_pypi_rate_limiter()
 
 
 @pytest.fixture

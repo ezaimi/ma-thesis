@@ -24,13 +24,24 @@ from pypi_retriever import (
 
 
 @pytest.fixture(autouse=True)
-def _reset_pypi_cache():
-    """The in-memory fetch cache is process-global; without this, an
-    earlier test's mocked response for e.g. "scikit-learn" would leak into
-    a later test that mocks a different response for the same name."""
+def _reset_pypi_cache(monkeypatch):
+    """The in-memory fetch cache and the rate-limit clock are both
+    process-global; without resetting them, an earlier test's mocked
+    response or throttling state would leak into a later, unrelated test.
+
+    Also monkeypatches time.sleep to a no-op by default, so a test that
+    doesn't care about rate limiting (e.g. one making two real,
+    non-monkeypatched requests) never actually blocks for real - a test
+    that specifically wants to observe sleeping overrides this itself with
+    its own monkeypatch.setattr(pypi_retriever.time, "sleep", ...) later in
+    the same test, which simply layers on top.
+    """
     pypi_retriever.clear_pypi_cache()
+    pypi_retriever.reset_pypi_rate_limiter()
+    monkeypatch.setattr(pypi_retriever.time, "sleep", lambda seconds: None)
     yield
     pypi_retriever.clear_pypi_cache()
+    pypi_retriever.reset_pypi_rate_limiter()
 
 
 def test_resolve_known_import_returns_verified_distribution():
@@ -862,6 +873,324 @@ def test_wrong_version_never_returns_a_command_field(monkeypatch):
     assert "command" not in result
     for candidate in result["candidate_versions"]:
         assert "command" not in candidate
+
+
+# --- offline production-path coverage for the five L5 PoC names -------------
+# Issue #42 checklist item 9 asks for the five L5 PoC names (sklearn, umap,
+# pkg_resources, scipy, dms_variants) to be re-run against the production
+# module. sklearn (see test_retrieve_resolved_path_returns_full_schema and
+# the wrong_version tests above, which use scipy) and dms_variants (see
+# test_retrieve_mapping_unknown_makes_no_network_request) already go through
+# retrieve() elsewhere in this file. The two tests below close the remaining
+# gap for umap and pkg_resources, which were previously only asserted in the
+# mapping table, never run through retrieve() itself.
+#
+# These are mocked/offline confirmations only - they prove retrieve()'s own
+# logic (mapping, endpoint, filtering, schema) behaves correctly for these
+# names. They are not the literal live PoC re-run issue #42 also asks for;
+# that comparison against the L5 PoC's own recorded findings (docs/rag-design.md
+# §9-§12) is performed separately, against the real PyPI API, as part of the
+# upcoming manual pilot - see the accompanying commit's final report.
+
+def test_retrieve_umap_resolves_to_umap_learn_and_applies_filtering(monkeypatch):
+    captured = {}
+    payload = {
+        "files": [
+            {"filename": "umap_learn-0.5.9-py3-none-any.whl", "yanked": False, "requires-python": ">=3.10"},
+            {"filename": "umap_learn-0.5.0-py3-none-any.whl", "yanked": True, "requires-python": ">=3.10"},
+        ]
+    }
+
+    def fake_urlopen(request, timeout=None):
+        captured["url"] = request.full_url
+        return FakeResponse(json.dumps(payload).encode("utf-8"))
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    result = retrieve("umap", python_version="3.10")
+
+    assert result["distribution_name"] == "umap-learn"
+    assert captured["url"] == "https://pypi.org/simple/umap-learn/"
+    assert result["status"] == "resolved"
+    versions = [c["version"] for c in result["candidate_versions"]]
+    assert versions == ["0.5.9"]  # the yanked 0.5.0 release is filtered out
+    assert set(result.keys()) == {
+        "status", "import_name", "subtype", "module_path", "symbol",
+        "distribution_name", "package_found", "python_version",
+        "latest_version", "candidate_versions", "compatibility_evidence",
+        "source_endpoint", "retrieved_at", "warnings", "error",
+    }
+
+
+def test_retrieve_pkg_resources_resolves_to_setuptools_and_applies_filtering(monkeypatch):
+    captured = {}
+    payload = {
+        "files": [
+            {"filename": "setuptools-80.0.0.tar.gz", "yanked": False, "requires-python": ">=3.9"},
+            {"filename": "setuptools-79.0.0-py3-none-any.whl", "yanked": False, "requires-python": "<3.8"},
+        ]
+    }
+
+    def fake_urlopen(request, timeout=None):
+        captured["url"] = request.full_url
+        return FakeResponse(json.dumps(payload).encode("utf-8"))
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    result = retrieve("pkg_resources", python_version="3.10")
+
+    assert result["distribution_name"] == "setuptools"
+    assert captured["url"] == "https://pypi.org/simple/setuptools/"
+    assert result["status"] == "resolved"
+    versions = [c["version"] for c in result["candidate_versions"]]
+    assert versions == ["80.0.0"]  # 79.0.0 is filtered out (requires-python <3.8 excludes 3.10)
+    assert set(result.keys()) == {
+        "status", "import_name", "subtype", "module_path", "symbol",
+        "distribution_name", "package_found", "python_version",
+        "latest_version", "candidate_versions", "compatibility_evidence",
+        "source_endpoint", "retrieved_at", "warnings", "error",
+    }
+
+
+# --- PyPI client rate limiting (i4, issue #42 checklist item 10) ------------
+
+def test_default_rate_limit_config_is_loaded_from_rag_repair_yaml():
+    assert pypi_retriever.DEFAULT_MIN_REQUEST_INTERVAL_SECONDS == 0.5
+    assert pypi_retriever.DEFAULT_MAX_RETRIES_ON_429 == 1
+    assert pypi_retriever.DEFAULT_MAX_RETRY_AFTER_SECONDS == 5.0
+
+
+def test_two_uncached_projects_are_throttled_by_the_configured_interval(monkeypatch):
+    sleep_calls = []
+    monkeypatch.setattr(pypi_retriever.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+
+    def fake_urlopen(request, timeout=None):
+        return FakeResponse(json.dumps({"files": []}).encode("utf-8"))
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    fetch_pypi_project("project-one", min_request_interval=1.0)
+    fetch_pypi_project("project-two", min_request_interval=1.0)
+
+    assert len(sleep_calls) == 1
+    # Almost no real time elapses between two in-process calls, so the
+    # computed remaining wait should be very close to the full interval.
+    assert 0.9 <= sleep_calls[0] <= 1.0
+
+
+def test_cache_hit_for_the_same_project_never_sleeps(monkeypatch):
+    sleep_calls = []
+    monkeypatch.setattr(pypi_retriever.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+
+    def fake_urlopen(request, timeout=None):
+        return FakeResponse(json.dumps({"files": []}).encode("utf-8"))
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    fetch_pypi_project("scikit-learn", min_request_interval=5.0)
+    fetch_pypi_project("scikit-learn", min_request_interval=5.0)
+    fetch_pypi_project("scikit-learn", min_request_interval=5.0)
+
+    assert sleep_calls == []
+
+
+def test_zero_interval_disables_throttling(monkeypatch):
+    sleep_calls = []
+    monkeypatch.setattr(pypi_retriever.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+
+    def fake_urlopen(request, timeout=None):
+        return FakeResponse(json.dumps({"files": []}).encode("utf-8"))
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    fetch_pypi_project("project-a", min_request_interval=0)
+    fetch_pypi_project("project-b", min_request_interval=0)
+
+    assert sleep_calls == []
+
+
+def _http_429(url, retry_after=None):
+    headers = {}
+    if retry_after is not None:
+        headers["Retry-After"] = retry_after
+    return urllib.error.HTTPError(url, 429, "Too Many Requests", headers, None)
+
+
+def test_http_429_is_recognized_explicitly_without_a_new_status(monkeypatch):
+    def fake_urlopen(request, timeout=None):
+        raise _http_429(request.full_url, retry_after="120")
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    status, data = fetch_pypi_project(
+        "scikit-learn", min_request_interval=0, max_retries_on_429=0,
+    )
+
+    assert status == "network_error"  # existing status contract preserved
+    assert data["reason"] == "rate_limited"
+    assert data["retry_after_seconds"] == 120.0
+
+
+def test_bounded_retry_honors_retry_after_and_then_succeeds(monkeypatch):
+    calls = {"count": 0}
+    sleep_calls = []
+    monkeypatch.setattr(pypi_retriever.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+
+    def fake_urlopen(request, timeout=None):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise _http_429(request.full_url, retry_after="2")
+        return FakeResponse(json.dumps({"files": []}).encode("utf-8"))
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    status, data = fetch_pypi_project(
+        "scikit-learn", min_request_interval=0, max_retries_on_429=1, max_retry_after_seconds=5.0,
+    )
+
+    assert status == "ok"
+    assert calls["count"] == 2
+    assert sleep_calls == [2.0]
+
+
+def test_malformed_retry_after_fails_safe_without_retrying(monkeypatch):
+    calls = {"count": 0}
+
+    def fake_urlopen(request, timeout=None):
+        calls["count"] += 1
+        raise _http_429(request.full_url, retry_after="not-a-number")
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    status, data = fetch_pypi_project(
+        "scikit-learn", min_request_interval=0, max_retries_on_429=1,
+    )
+
+    assert status == "network_error"
+    assert calls["count"] == 1  # no retry attempted with an unknown wait time
+    assert data["reason"] == "rate_limited"
+    assert data["retry_after_seconds"] is None
+
+
+def test_negative_retry_after_fails_safe_without_retrying(monkeypatch):
+    calls = {"count": 0}
+
+    def fake_urlopen(request, timeout=None):
+        calls["count"] += 1
+        raise _http_429(request.full_url, retry_after="-5")
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    status, data = fetch_pypi_project(
+        "scikit-learn", min_request_interval=0, max_retries_on_429=1,
+    )
+
+    assert status == "network_error"
+    assert calls["count"] == 1
+    assert data["retry_after_seconds"] is None
+
+
+def test_retry_after_larger_than_configured_maximum_is_not_honored(monkeypatch):
+    calls = {"count": 0}
+
+    def fake_urlopen(request, timeout=None):
+        calls["count"] += 1
+        raise _http_429(request.full_url, retry_after="9999")
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    status, data = fetch_pypi_project(
+        "scikit-learn", min_request_interval=0, max_retries_on_429=1, max_retry_after_seconds=5.0,
+    )
+
+    assert status == "network_error"
+    assert calls["count"] == 1  # exceeds max_retry_after_seconds - never waited on
+    assert data["retry_after_seconds"] == 9999.0
+
+
+def test_no_unbounded_retry_on_repeated_429(monkeypatch):
+    calls = {"count": 0}
+
+    def fake_urlopen(request, timeout=None):
+        calls["count"] += 1
+        raise _http_429(request.full_url, retry_after="1")
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    status, data = fetch_pypi_project(
+        "scikit-learn", min_request_interval=0, max_retries_on_429=1, max_retry_after_seconds=5.0,
+    )
+
+    assert status == "network_error"
+    assert calls["count"] == 2  # exactly one initial attempt + one bounded retry
+    assert data["retries_attempted"] == 1
+    assert data["max_retries"] == 1
+
+
+def test_retrieve_surfaces_rate_limit_info_in_existing_error_and_warnings_fields(monkeypatch):
+    def fake_urlopen(request, timeout=None):
+        raise _http_429(request.full_url, retry_after="30")
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    result = retrieve("sklearn")
+
+    assert result["status"] == "network_error"  # existing status contract preserved
+    assert "429" in result["error"]
+    assert result["warnings"] == [result["error"]]
+    # no new top-level field was added to the retrieval-result schema
+    assert set(result.keys()) == {
+        "status", "import_name", "subtype", "module_path", "symbol",
+        "distribution_name", "package_found", "python_version",
+        "latest_version", "candidate_versions", "compatibility_evidence",
+        "source_endpoint", "retrieved_at", "warnings", "error",
+    }
+
+
+def test_ordinary_network_error_message_is_unchanged_by_rate_limit_handling(monkeypatch):
+    def fake_urlopen(request, timeout=None):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    result = retrieve("sklearn")
+
+    assert result["status"] == "network_error"
+    assert result["error"] == "Could not reach PyPI (timeout, DNS, or connection failure)."
+    assert result["warnings"] == []
+
+
+def test_timeout_behavior_is_unchanged_by_rate_limit_handling(monkeypatch):
+    def fake_urlopen(request, timeout=None):
+        raise socket.timeout("timed out")
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    status, data = fetch_pypi_project("scikit-learn", min_request_interval=0)
+
+    assert status == "network_error"
+    assert data is None
+
+
+def test_default_autouse_no_op_sleep_prevents_real_waiting(monkeypatch):
+    """Confirms the autouse fixture's default time.sleep no-op (not a
+    per-test override) is what protects a test that triggers throttling
+    without thinking about it - e.g. two real, uncached requests under the
+    real config default interval (0.5s). Without that fixture, this test
+    would actually block for close to half a second."""
+    import time as real_time
+
+    def fake_urlopen(request, timeout=None):
+        return FakeResponse(json.dumps({"files": []}).encode("utf-8"))
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    start = real_time.monotonic()
+    fetch_pypi_project("project-x")  # min_request_interval not overridden -> config default
+    fetch_pypi_project("project-y")
+    elapsed = real_time.monotonic() - start
+
+    assert elapsed < 0.1
 
 
 # --- zero-network / zero-side-effect guarantees ------------------------------

@@ -228,6 +228,13 @@ Do not catch every exception and label it a network failure. HTTP, connection, p
 - A nonsense package returns `package_not_found` without throwing.
 - The request includes the required JSON `Accept` header.
 
+**Implemented (i4), rate limiting added:** `fetch_pypi_project()` now also throttles real
+(uncached) requests to a configurable minimum spacing and handles HTTP 429 with a single bounded,
+`Retry-After`-honoring retry - see `docs/rag-design.md` §2.4 for the full contract and
+`config/rag_repair.yaml`'s `pypi_client.rate_limit` block for the configured values. The `(status,
+data)` return contract from this section's sketch is unchanged; a 429 still resolves to
+`"network_error"`, just with a small structured `data` payload instead of `None`.
+
 ---
 
 ## 8. Step 5 — Group Files by Release Version

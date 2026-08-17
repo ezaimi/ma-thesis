@@ -22,6 +22,32 @@
 runtime:
   python_version: "3.10"
 
+# PyPI HTTP client rate limiting (i4, issue #42 checklist item 10). Caching
+# (scripts/pypi_retriever.py's in-memory _pypi_response_cache) already
+# avoids repeat requests for the same distribution within one run; this
+# section adds the missing half - spacing between distinct real requests.
+# Single-process, in-memory only - not persistent across runs, not
+# distributed across parallel workers. See docs/rag-design.md §2.4.
+pypi_client:
+  rate_limit:
+    # Minimum spacing, in seconds, enforced before each real (uncached)
+    # PyPI request. A cache hit never waits and is never counted. 0.5s is a
+    # conservative default, well under PyPI's documented anonymous rate
+    # limits. Set to 0 to disable throttling (e.g. in tests).
+    min_request_interval_seconds: 0.5
+
+    # HTTP 429 handling: at most this many bounded retries for one logical
+    # fetch_pypi_project() call, honored only when the server's Retry-After
+    # header is present and parses as a plain number of seconds (the
+    # HTTP-date form is not supported and is treated the same as "no
+    # Retry-After given" - never guessed, never crashed on).
+    max_retries_on_429: 1
+
+    # A Retry-After value larger than this is never waited on - the request
+    # fails as "network_error" instead of blocking a batch run for an
+    # unbounded amount of time.
+    max_retry_after_seconds: 5.0
+
 # RAGRepairAgent (i4) settings. Mirrors config/llm_explainer.yaml's shape
 # and reuses the same model (Gemma-2 9B via Ollama) - the L4 decision
 # (docs/prompts.md §5) was to share one model between LLMExplainer and
