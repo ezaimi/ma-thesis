@@ -336,6 +336,13 @@ Confirm that it removes the fixture's yanked, incompatible, and prerelease entri
 
 ## 10. Step 7 — Assemble the Retrieval Result
 
+**Implemented (i4):** `retrieve()` exists in `scripts/pypi_retriever.py` with a signature extended
+beyond this section's original sketch - it also accepts `subtype`, `module_path`, and `symbol`, so
+it can perform the `wrong_version` compatibility-evidence intersection this plan's Step 8 (below)
+originally left to `rag_repair_agent.py`. Calls omitting those three parameters behave exactly as
+sketched here. See `docs/rag-design.md` §2.3 for the exact, current input/output contract; that
+section is authoritative where it differs from this plan.
+
 Implement the public entry point:
 
 ```python

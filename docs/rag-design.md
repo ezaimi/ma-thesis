@@ -134,14 +134,114 @@ This module only proposes. It does not run `pip`, does not modify a notebook's e
 does not confirm that a proposed pin actually resolves the original error - that confirmation is
 FixApplicator's job (a later step, out of scope here), via re-execution.
 
-**Implemented now vs. planned.** As of this writing: import-name resolution and normalization
-(`pypi_retriever.resolve_distribution_name`/`normalize_distribution_name`) and the API-compatibility
-evidence lookup and intersection (`scripts/compatibility_evidence.py`, all of step 1's `wrong_version`
-half) are implemented and tested. Everything else in this contract - the PyPI HTTP retrieval and
-yanked/pre-release/Python-version filtering (the rest of step 1), the LLM call itself, the
-validator, the command builder, and `scripts/rag_repair_agent.py` as an entry point - is design
-only; none of it exists in code yet. This section describes the target the next implementation
-step should build toward, not a description of running code.
+**Implemented now vs. planned.** As of this writing, step 1 (the deterministic retriever) is fully
+implemented in `scripts/pypi_retriever.py` and `scripts/compatibility_evidence.py`, including the
+`wrong_version` compatibility-evidence intersection - see §2.3 below for its exact contract. Steps
+2-4 (the LLM proposal, the deterministic validator, and the command builder) remain design only:
+`scripts/rag_repair_agent.py` does not exist yet. `retrieve()`'s output (§2.3) is exactly the
+"grounded candidate set" step 2 is meant to receive - implementing `rag_repair_agent.py` against
+that output is the remaining work.
+
+### 2.3 `retrieve()` - implemented contract (i4)
+
+`scripts/pypi_retriever.retrieve()` is the deterministic retriever from §2.2 step 1, fully
+implemented and tested (`tests/test_pypi_retriever.py`).
+
+**Signature:**
+
+```python
+retrieve(
+    import_name: str,
+    python_version: Optional[str] = None,
+    subtype: str = "missing_package",
+    module_path: Optional[str] = None,
+    symbol: Optional[str] = None,
+) -> Dict[str, Any]
+```
+
+This deviates from `day-1-rag-repair-agent-plan.md`'s original two-parameter sketch
+(`retrieve(import_name, python_version=None)`): `subtype`, `module_path`, and `symbol` were added
+so one entry point can also perform the `wrong_version` intersection, rather than introducing a
+second, parallel function. Calls that omit the new parameters behave exactly as the original
+signature (`subtype` defaults to `"missing_package"`).
+
+**Sequence:**
+
+1. Resolve `python_version` - the caller's explicit value if given, else
+   `config/rag_repair.yaml`'s `runtime.python_version`. If neither is available (missing or
+   malformed configuration, and no override), return immediately with status
+   `"configuration_error"` - no PyPI request is made, and the runtime version is never silently
+   inferred from notebook metadata or a second hardcoded constant.
+2. For `subtype == "wrong_version"`, require `module_path` and `symbol`. If either is missing,
+   return immediately with status `"no_compatible_release"` - a caller-input problem, decided
+   before any network activity, the same way `"mapping_unknown"` is.
+3. Resolve `import_name` via `config/package_mapping.yaml`. If unmapped, return status
+   `"mapping_unknown"` - no PyPI request is made.
+4. Normalize the resolved distribution name (PEP 503) and fetch it from the official PyPI JSON
+   Simple API (PEP 691) via `fetch_pypi_project()` - `https://pypi.org/simple/{name}/` only, never
+   a caller-, LLM-, or input-record-supplied URL. Repeated calls for the same normalized name
+   within one process reuse an in-memory cache (§2.4) instead of re-requesting.
+5. Parse and group the returned files by release version (`packaging.utils`), and compute the
+   **PyPI-metadata-safe candidate set**: drop invalid/unparseable files, pre-releases, and releases
+   where every file is yanked; evaluate `requires-python` against the resolved Python version. This
+   set is computed **uncapped** - the five-item limit is applied only once, at the very end (see
+   §2.2's ordering note and §7).
+6. For `subtype == "missing_package"`: `candidate_versions` is this safe set, capped to five,
+   newest first. Status is `"resolved"` if non-empty, else `"no_compatible_release"`.
+7. For `subtype == "wrong_version"`: look up `config/api_compatibility_evidence.yaml` via
+   `compatibility_evidence.lookup_compatibility_evidence()`. If it does not return `"resolved"`
+   (i.e. `"no_evidence"` or `"invalid_entry"`), return status `"no_compatible_release"` with
+   `candidate_versions: []` and `compatibility_evidence` recording why. Otherwise, intersect the
+   **uncapped** safe set from step 5 with the evidence via
+   `filter_versions_by_compatibility_evidence()`, *then* cap to five. Status is `"resolved"` if the
+   intersection is non-empty, else `"no_compatible_release"`.
+
+**Output schema** (every field always present, on every path):
+
+| Field | Meaning |
+| --- | --- |
+| `status` | `resolved \| mapping_unknown \| package_not_found \| no_compatible_release \| network_error \| invalid_response \| configuration_error` |
+| `import_name` | Echoed input. |
+| `subtype` | Echoed input (`"missing_package"` or `"wrong_version"`). |
+| `module_path`, `symbol` | Echoed input; `null` unless `subtype == "wrong_version"`. |
+| `distribution_name` | Resolved PyPI distribution, or `null` if unmapped. |
+| `package_found` | `true`/`false`/`null` (`null` when no PyPI request was made). |
+| `python_version` | The Python version actually used for this call - always recorded, even under an override. |
+| `latest_version` | Newest non-prerelease, non-fully-yanked release PyPI reports, independent of Python filtering. |
+| `candidate_versions` | The final, capped, safe (and, for `wrong_version`, API-compatible) list. Each entry: `version`, `requires_python`, `python_compatibility` (`compatible \| incompatible-never-appears-here \| unknown`), `yanked` (always `false` for a surviving entry), `yanked_reason`. |
+| `compatibility_evidence` | `null` for `missing_package`; for `wrong_version`, `{status, compatible_specifier, evidence}` from the registry lookup. |
+| `source_endpoint` | The exact PyPI URL queried, or `null` if none was needed. |
+| `retrieved_at` | ISO 8601 timestamp of the fetch, or `null` if none was made. |
+| `warnings` | Non-fatal issues encountered (unparseable filenames, invalid `requires-python`, invalid `python_version`) - also printed to stderr, but captured here so a later validator can see them without reading logs. |
+| `error` | Human-readable failure reason, or `null` on success. |
+
+This extends the original ten-field schema sketched earlier in this document with four fields
+(`subtype`, `module_path`, `symbol`, `compatibility_evidence`, `warnings` - five, in fact) needed
+for the provenance a later deterministic validator requires: which subtype was requested, whether
+compatibility evidence was applied and from where, and what was silently worked around during
+retrieval. `candidate_versions` never carries a `python_compatibility: "incompatible"` entry -
+incompatible releases are excluded outright, not retained with that label (consistent with the L5
+PoC's own finding, §12).
+
+**Known schema limitation:** `"compatible"` and `"unknown"` candidates currently sit in the same
+`candidate_versions` list, distinguished only by the `python_compatibility` field. A caller that
+reads `version` without also checking `python_compatibility` could treat an unproven release as
+confirmed. No change was made to fix this in this step - the recommended policy is that
+`rag_repair_agent.py`'s deterministic validator must always check `python_compatibility ==
+"compatible"` before treating a `missing_package` candidate as safe (this requirement doesn't
+apply to `wrong_version`, where every surviving candidate has already been proven via the
+compatibility-evidence intersection, independent of `python_compatibility`).
+
+### 2.4 Caching (i4)
+
+`fetch_pypi_project()` keeps a simple in-memory, process-lifetime cache keyed by normalized
+distribution name, so one retrieval run never issues two requests for the same project - relevant
+given several `failing_module` values (e.g. `sklearn`, `pkg_resources`) recur dozens of times
+across the 214-row dataset. This is deliberately minimal: no persistence across runs, no TTL, no
+retry/backoff, no rate limiting. Retry-on-transient-failure remains explicitly optional per §9.3
+("the production implementation in i4 *may* use a bounded retry policy") and is not implemented;
+rate limiting is not implemented either. Both remain open, non-blocking i4 items - see the "later
+in i4" list in the audit report accompanying this commit.
 
 
 

@@ -4,6 +4,8 @@ import sys
 import urllib.error
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
@@ -13,10 +15,22 @@ from pypi_retriever import (
     fetch_pypi_project,
     filter_candidate_versions,
     load_package_mapping,
+    load_rag_repair_config,
     normalize_distribution_name,
     resolve_distribution_name,
     retrieve,
+    validate_python_version_config,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_pypi_cache():
+    """The in-memory fetch cache is process-global; without this, an
+    earlier test's mocked response for e.g. "scikit-learn" would leak into
+    a later test that mocks a different response for the same name."""
+    pypi_retriever.clear_pypi_cache()
+    yield
+    pypi_retriever.clear_pypi_cache()
 
 
 def test_resolve_known_import_returns_verified_distribution():
@@ -60,8 +74,96 @@ def test_package_mapping_loads_expected_entries():
     assert mapping["pandas"] == "pandas"
 
 
+# --- repair-runtime configuration (config/rag_repair.yaml) ------------------
+
 def test_default_python_version_comes_from_rag_repair_config():
     assert DEFAULT_PYTHON_VERSION == "3.10"
+
+
+def test_load_rag_repair_config_reads_python_version():
+    config = load_rag_repair_config()
+    assert config["runtime"]["python_version"] == "3.10"
+
+
+def test_load_rag_repair_config_accepts_injected_path(tmp_path):
+    config_path = tmp_path / "custom_rag_repair.yaml"
+    config_path.write_text("runtime:\n  python_version: \"3.12\"\n", encoding="utf-8")
+
+    config = load_rag_repair_config(path=str(config_path))
+
+    assert config["runtime"]["python_version"] == "3.12"
+
+
+def test_load_rag_repair_config_missing_file_raises(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        load_rag_repair_config(path=str(tmp_path / "does_not_exist.yaml"))
+
+
+def test_validate_python_version_config_accepts_valid_version():
+    version, error = validate_python_version_config("3.10")
+    assert version == "3.10"
+    assert error is None
+
+
+def test_validate_python_version_config_rejects_missing_value():
+    version, error = validate_python_version_config(None)
+    assert version is None
+    assert "missing" in error.lower()
+
+
+def test_validate_python_version_config_rejects_empty_string():
+    version, error = validate_python_version_config("")
+    assert version is None
+    assert error is not None
+
+
+def test_validate_python_version_config_rejects_non_string():
+    version, error = validate_python_version_config(310)
+    assert version is None
+    assert error is not None
+
+
+def test_validate_python_version_config_rejects_malformed_version():
+    version, error = validate_python_version_config("not-a-version")
+    assert version is None
+    assert "not a valid" in error.lower()
+
+
+def test_retrieve_uses_configuration_error_when_default_config_is_broken(monkeypatch):
+    """A malformed/missing config must never silently fall back to notebook
+    metadata or a second hardcoded version - it must fail as a structured
+    retrieval status, with no PyPI request attempted."""
+    monkeypatch.setattr(pypi_retriever, "DEFAULT_PYTHON_VERSION", None)
+    monkeypatch.setattr(pypi_retriever, "DEFAULT_PYTHON_VERSION_ERROR", "simulated broken config")
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("must not query PyPI when the default Python version is unresolvable")
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fail_if_called)
+
+    result = retrieve("sklearn")
+
+    assert result["status"] == "configuration_error"
+    assert result["error"] == "simulated broken config"
+
+
+def test_retrieve_explicit_python_version_bypasses_broken_default_config(monkeypatch):
+    """An explicit override is dependency injection for callers/tests, not
+    a silent alternate production source - it works even if the on-disk
+    default config is broken, because the caller supplied a value directly
+    instead of relying on the file."""
+    monkeypatch.setattr(pypi_retriever, "DEFAULT_PYTHON_VERSION", None)
+    monkeypatch.setattr(pypi_retriever, "DEFAULT_PYTHON_VERSION_ERROR", "simulated broken config")
+
+    def fake_urlopen(request, timeout=None):
+        return FakeResponse(json.dumps({"files": []}).encode("utf-8"))
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    result = retrieve("sklearn", python_version="3.11")
+
+    assert result["status"] != "configuration_error"
+    assert result["python_version"] == "3.11"
 
 
 # --- fetch_pypi_project ------------------------------------------------------
@@ -80,11 +182,12 @@ class FakeResponse:
         return False
 
 
-def test_fetch_pypi_project_sends_required_accept_header(monkeypatch):
+def test_fetch_pypi_project_sends_required_accept_and_user_agent_headers(monkeypatch):
     captured = {}
 
     def fake_urlopen(request, timeout=None):
         captured["headers"] = dict(request.header_items())
+        captured["url"] = request.full_url
         return FakeResponse(json.dumps({"files": []}).encode("utf-8"))
 
     monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
@@ -92,6 +195,34 @@ def test_fetch_pypi_project_sends_required_accept_header(monkeypatch):
     fetch_pypi_project("scikit-learn")
 
     assert captured["headers"]["Accept"] == "application/vnd.pypi.simple.v1+json"
+    assert captured["headers"]["User-agent"] == pypi_retriever.USER_AGENT
+    assert captured["url"] == "https://pypi.org/simple/scikit-learn/"
+
+
+def test_fetch_pypi_project_only_targets_the_official_pypi_host(monkeypatch):
+    captured = {}
+
+    def fake_urlopen(request, timeout=None):
+        captured["url"] = request.full_url
+        return FakeResponse(json.dumps({"files": []}).encode("utf-8"))
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    fetch_pypi_project("umap-learn")
+
+    assert captured["url"].startswith("https://pypi.org/simple/")
+
+
+def test_fetch_pypi_project_rejects_unnormalized_name_without_a_request(monkeypatch):
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("must not build a URL from an unnormalized/unsafe name")
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fail_if_called)
+
+    status, data = fetch_pypi_project("Not Normalized/../etc")
+
+    assert status == "invalid_response"
+    assert data is None
 
 
 def test_fetch_pypi_project_returns_files_list_on_success(monkeypatch):
@@ -118,6 +249,17 @@ def test_fetch_pypi_project_404_returns_package_not_found(monkeypatch):
 
     assert status == "package_not_found"
     assert data is None
+
+
+def test_fetch_pypi_project_other_http_error_returns_network_error(monkeypatch):
+    def fake_urlopen(request, timeout=None):
+        raise urllib.error.HTTPError(request.full_url, 503, "Service Unavailable", None, None)
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    status, data = fetch_pypi_project("scikit-learn")
+
+    assert status == "network_error"
 
 
 def test_fetch_pypi_project_connection_failure_returns_network_error(monkeypatch):
@@ -175,6 +317,67 @@ def test_fetch_pypi_project_non_list_files_returns_invalid_response(monkeypatch)
     status, data = fetch_pypi_project("scikit-learn")
 
     assert status == "invalid_response"
+
+
+def test_fetch_pypi_project_accepts_injected_urlopen_without_monkeypatching_module():
+    calls = {"count": 0}
+
+    def fake_urlopen(request, timeout=None):
+        calls["count"] += 1
+        return FakeResponse(json.dumps({"files": []}).encode("utf-8"))
+
+    status, data = fetch_pypi_project("scikit-learn", urlopen=fake_urlopen)
+
+    assert status == "ok"
+    assert calls["count"] == 1
+
+
+def test_fetch_pypi_project_caches_repeated_requests_within_a_run(monkeypatch):
+    calls = {"count": 0}
+
+    def fake_urlopen(request, timeout=None):
+        calls["count"] += 1
+        return FakeResponse(json.dumps({"files": []}).encode("utf-8"))
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    fetch_pypi_project("scikit-learn")
+    fetch_pypi_project("scikit-learn")
+    fetch_pypi_project("scikit-learn")
+
+    assert calls["count"] == 1
+
+
+def test_fetch_pypi_project_use_cache_false_bypasses_cache(monkeypatch):
+    calls = {"count": 0}
+
+    def fake_urlopen(request, timeout=None):
+        calls["count"] += 1
+        return FakeResponse(json.dumps({"files": []}).encode("utf-8"))
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    fetch_pypi_project("scikit-learn", use_cache=False)
+    fetch_pypi_project("scikit-learn", use_cache=False)
+
+    assert calls["count"] == 2
+
+
+def test_retrieve_does_not_repeat_a_pypi_request_for_the_same_distribution(monkeypatch):
+    calls = {"count": 0}
+
+    def fake_urlopen(request, timeout=None):
+        calls["count"] += 1
+        return FakeResponse(json.dumps({
+            "files": [{"filename": "scikit_learn-1.9.0.tar.gz", "yanked": False}]
+        }).encode("utf-8"))
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    retrieve("sklearn")
+    retrieve("sklearn")
+
+    assert calls["count"] == 1
 
 
 # --- filter_candidate_versions -----------------------------------------------
@@ -242,6 +445,22 @@ def test_filter_candidate_versions_retains_unknown_compatibility_release():
     assert unknown["python_compatibility"] == "unknown"
 
 
+def test_unknown_and_compatible_candidates_are_not_schema_distinguishable_beyond_the_tag():
+    """"unknown" and "compatible" entries sit in the same candidate_versions
+    list, distinguished only by python_compatibility - a caller that reads
+    "version" without also checking python_compatibility could mistake an
+    unproven release for a confirmed one. Documented as a known risk (see
+    the audit report); not fixed by data-shape change in this task."""
+    files, _ = load_l5_poc_fixture_as_files()
+
+    result = filter_candidate_versions(files, "3.13", limit=5)
+    tags = {c["python_compatibility"] for c in result}
+
+    assert "compatible" in tags
+    assert "unknown" in tags
+    assert all("python_compatibility" in c for c in result)
+
+
 def test_filter_candidate_versions_with_unknown_python_version_marks_all_unknown():
     files = [
         {"filename": "pkg-1.0.0.tar.gz", "yanked": False, "requires-python": ">=3.9"},
@@ -263,6 +482,17 @@ def test_filter_candidate_versions_caps_at_limit():
     result = filter_candidate_versions(files, None, limit=5)
 
     assert len(result) == 5
+
+
+def test_filter_candidate_versions_limit_none_returns_everything_uncapped():
+    files = [
+        {"filename": f"pkg-{i}.0.0.tar.gz", "yanked": False}
+        for i in range(1, 9)
+    ]
+
+    result = filter_candidate_versions(files, None, limit=None)
+
+    assert len(result) == 8
 
 
 def test_filter_candidate_versions_sorts_by_real_version_not_string_order():
@@ -290,7 +520,30 @@ def test_filter_candidate_versions_skips_unparseable_filename_safely(capsys):
     assert "not-a-valid-filename" in capsys.readouterr().err
 
 
-# --- retrieve() ---------------------------------------------------------------
+def test_filter_candidate_versions_skips_malformed_requires_python(capsys):
+    files = [
+        {"filename": "pkg-1.0.0.tar.gz", "yanked": False, "requires-python": "not a specifier!!"},
+    ]
+
+    result = filter_candidate_versions(files, "3.10", limit=5)
+
+    assert result[0]["python_compatibility"] == "unknown"
+    assert "invalid requires-python" in capsys.readouterr().err.lower()
+
+
+def test_filter_candidate_versions_wheel_and_sdist_for_same_version_produce_one_candidate():
+    files = [
+        {"filename": "scikit_learn-1.9.0-cp310-cp310-manylinux_2_17_x86_64.whl", "yanked": False},
+        {"filename": "scikit-learn-1.9.0.tar.gz", "yanked": False},
+    ]
+
+    result = filter_candidate_versions(files, None, limit=5)
+
+    assert len(result) == 1
+    assert result[0]["version"] == "1.9.0"
+
+
+# --- retrieve(): missing_package ---------------------------------------------
 
 def test_retrieve_mapping_unknown_makes_no_network_request(monkeypatch):
     def fail_if_called(*args, **kwargs):
@@ -301,6 +554,7 @@ def test_retrieve_mapping_unknown_makes_no_network_request(monkeypatch):
     result = retrieve("dms_variants")
 
     assert result["status"] == "mapping_unknown"
+    assert result["subtype"] == "missing_package"
     assert result["distribution_name"] is None
     assert result["package_found"] is None
     assert result["candidate_versions"] == []
@@ -346,17 +600,21 @@ def test_retrieve_resolved_path_returns_full_schema(monkeypatch):
     result = retrieve("sklearn", python_version="3.10")
 
     assert result["status"] == "resolved"
+    assert result["subtype"] == "missing_package"
     assert result["distribution_name"] == "scikit-learn"
     assert result["package_found"] is True
     assert result["latest_version"] == "1.9.0"
     assert [c["version"] for c in result["candidate_versions"]] == ["1.9.0", "1.8.0"]
     assert result["source_endpoint"] == "https://pypi.org/simple/scikit-learn/"
     assert result["retrieved_at"] is not None
+    assert result["compatibility_evidence"] is None
+    assert result["warnings"] == []
     assert result["error"] is None
     assert set(result.keys()) == {
-        "status", "import_name", "distribution_name", "package_found",
-        "python_version", "latest_version", "candidate_versions",
-        "source_endpoint", "retrieved_at", "error",
+        "status", "import_name", "subtype", "module_path", "symbol",
+        "distribution_name", "package_found", "python_version",
+        "latest_version", "candidate_versions", "compatibility_evidence",
+        "source_endpoint", "retrieved_at", "warnings", "error",
     }
 
 
@@ -437,3 +695,197 @@ def test_module_never_builds_a_pip_command():
     assert "pip install" not in source
     assert "subprocess" not in source
     assert "os.system" not in source
+
+
+def test_module_never_calls_ollama():
+    source = Path(pypi_retriever.__file__).read_text(encoding="utf-8")
+
+    assert "ollama" not in source.lower()
+    assert "11434" not in source
+
+
+# --- retrieve(): wrong_version compatibility-evidence intersection ----------
+
+def _scipy_payload(versions, requires_python=">=3.10"):
+    return {
+        "files": [
+            {"filename": f"scipy-{v}.tar.gz", "yanked": False, "requires-python": requires_python}
+            for v in versions
+        ]
+    }
+
+
+def _numpy_payload(versions, requires_python=">=3.10"):
+    return {
+        "files": [
+            {"filename": f"numpy-{v}.tar.gz", "yanked": False, "requires-python": requires_python}
+            for v in versions
+        ]
+    }
+
+
+def test_wrong_version_cumtrapz_intersects_with_scipy_compatibility_evidence(monkeypatch):
+    def fake_urlopen(request, timeout=None):
+        return FakeResponse(json.dumps(_scipy_payload(["1.13.0", "1.13.1", "1.14.0"])).encode("utf-8"))
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    result = retrieve(
+        "scipy", python_version="3.10", subtype="wrong_version",
+        module_path="scipy.integrate", symbol="cumtrapz",
+    )
+
+    assert result["status"] == "resolved"
+    assert result["compatibility_evidence"]["status"] == "resolved"
+    assert result["compatibility_evidence"]["compatible_specifier"] == "<1.14.0"
+    versions = {c["version"] for c in result["candidate_versions"]}
+    assert versions == {"1.13.0", "1.13.1"}
+    assert "1.14.0" not in versions
+
+
+def test_wrong_version_isshape_intersects_with_scipy_compatibility_evidence(monkeypatch):
+    def fake_urlopen(request, timeout=None):
+        return FakeResponse(json.dumps(_scipy_payload(["1.13.1", "1.14.0", "1.14.1"])).encode("utf-8"))
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    result = retrieve(
+        "scipy", python_version="3.10", subtype="wrong_version",
+        module_path="scipy.sparse.sputils", symbol="isshape",
+    )
+
+    assert result["status"] == "resolved"
+    versions = {c["version"] for c in result["candidate_versions"]}
+    assert versions == {"1.13.1"}
+
+
+def test_wrong_version_visible_deprecation_warning_intersects_with_numpy_compatibility_evidence(monkeypatch):
+    def fake_urlopen(request, timeout=None):
+        return FakeResponse(json.dumps(_numpy_payload(["1.26.4", "2.0.0", "2.1.0"])).encode("utf-8"))
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    result = retrieve(
+        "numpy", python_version="3.10", subtype="wrong_version",
+        module_path="numpy", symbol="VisibleDeprecationWarning",
+    )
+
+    assert result["status"] == "resolved"
+    assert result["compatibility_evidence"]["compatible_specifier"] == "<2.0.0"
+    versions = {c["version"] for c in result["candidate_versions"]}
+    assert versions == {"1.26.4"}
+    assert "2.0.0" not in versions
+    assert "2.1.0" not in versions
+
+
+def test_wrong_version_intersection_applied_before_five_item_cap_not_after(monkeypatch):
+    """The core ordering requirement: seven releases, the five newest are
+    all API-incompatible (>=1.14.0). If the five-item cap were applied
+    before the compatibility intersection, the two older compatible
+    releases (1.13.0, 1.13.1) would already be gone and the result would be
+    wrongly empty."""
+    versions = ["1.13.0", "1.13.1", "1.14.0", "1.14.1", "1.15.0", "1.15.1", "1.16.0"]
+
+    def fake_urlopen(request, timeout=None):
+        return FakeResponse(json.dumps(_scipy_payload(versions)).encode("utf-8"))
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    result = retrieve(
+        "scipy", python_version="3.10", subtype="wrong_version",
+        module_path="scipy.integrate", symbol="cumtrapz",
+    )
+
+    survivors = {c["version"] for c in result["candidate_versions"]}
+    assert survivors == {"1.13.0", "1.13.1"}
+    assert result["status"] == "resolved"
+
+
+def test_wrong_version_missing_evidence_returns_safe_abstention(monkeypatch):
+    def fake_urlopen(request, timeout=None):
+        return FakeResponse(json.dumps(_scipy_payload(["1.13.0"])).encode("utf-8"))
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    result = retrieve(
+        "scipy", python_version="3.10", subtype="wrong_version",
+        module_path="scipy.some.unregistered", symbol="not_a_real_symbol",
+    )
+
+    assert result["status"] == "no_compatible_release"
+    assert result["candidate_versions"] == []
+    assert result["compatibility_evidence"]["status"] == "no_evidence"
+    assert result["error"]
+
+
+def test_wrong_version_missing_module_path_or_symbol_returns_safe_abstention(monkeypatch):
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("must not need to query PyPI to know the request is malformed")
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fail_if_called)
+
+    result = retrieve("scipy", python_version="3.10", subtype="wrong_version")
+
+    assert result["status"] == "no_compatible_release"
+    assert result["error"]
+
+
+def test_wrong_version_empty_pypi_intersection_returns_no_compatible_release(monkeypatch):
+    """Evidence is resolved, but every PyPI release for this distribution is
+    newer than the compatibility boundary - intersection is empty."""
+    def fake_urlopen(request, timeout=None):
+        return FakeResponse(json.dumps(_scipy_payload(["1.15.0", "1.16.0"])).encode("utf-8"))
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    result = retrieve(
+        "scipy", python_version="3.10", subtype="wrong_version",
+        module_path="scipy.integrate", symbol="cumtrapz",
+    )
+
+    assert result["status"] == "no_compatible_release"
+    assert result["candidate_versions"] == []
+    assert result["compatibility_evidence"]["status"] == "resolved"
+
+
+def test_wrong_version_never_returns_a_command_field(monkeypatch):
+    def fake_urlopen(request, timeout=None):
+        return FakeResponse(json.dumps(_scipy_payload(["1.13.0"])).encode("utf-8"))
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    result = retrieve(
+        "scipy", python_version="3.10", subtype="wrong_version",
+        module_path="scipy.integrate", symbol="cumtrapz",
+    )
+
+    assert "command" not in result
+    for candidate in result["candidate_versions"]:
+        assert "command" not in candidate
+
+
+# --- zero-network / zero-side-effect guarantees ------------------------------
+
+def test_retrieve_makes_exactly_one_network_call_per_new_distribution(monkeypatch):
+    calls = {"count": 0}
+
+    def fake_urlopen(request, timeout=None):
+        calls["count"] += 1
+        return FakeResponse(json.dumps(_scipy_payload(["1.13.0"])).encode("utf-8"))
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    retrieve("scipy", python_version="3.10", subtype="wrong_version",
+              module_path="scipy.integrate", symbol="cumtrapz")
+
+    assert calls["count"] == 1
+
+
+def test_no_real_network_module_is_used_for_transport():
+    """Guards against a future edit accidentally adding requests/httpx or
+    similar - the only HTTP surface must remain urllib, which every test in
+    this file mocks."""
+    source = Path(pypi_retriever.__file__).read_text(encoding="utf-8")
+
+    assert "import requests" not in source
+    assert "import httpx" not in source
