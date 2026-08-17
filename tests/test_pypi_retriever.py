@@ -374,6 +374,174 @@ def test_fetch_pypi_project_use_cache_false_bypasses_cache(monkeypatch):
     assert calls["count"] == 2
 
 
+# --- caching policy: only "ok" and "package_not_found" are cached (i4) ------
+# Every other status (network_error in all its forms, and invalid_response in
+# all its forms) is treated as possibly transient - a call for the same
+# distribution right after a transient failure must always try again for
+# real, never replay the stale failure from the cache.
+
+def test_fetch_pypi_project_package_not_found_is_cached(monkeypatch):
+    calls = {"count": 0}
+
+    def fake_urlopen(request, timeout=None):
+        calls["count"] += 1
+        raise urllib.error.HTTPError(request.full_url, 404, "Not Found", None, None)
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    fetch_pypi_project("not-a-real-package-xyz")
+    fetch_pypi_project("not-a-real-package-xyz")
+
+    assert calls["count"] == 1  # the one deliberate negative-caching exception
+
+
+def test_fetch_pypi_project_network_error_is_not_cached_and_retries_for_real(monkeypatch):
+    calls = {"count": 0}
+
+    def fake_urlopen(request, timeout=None):
+        calls["count"] += 1
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    status1, _ = fetch_pypi_project("scikit-learn")
+    status2, _ = fetch_pypi_project("scikit-learn")
+
+    assert status1 == status2 == "network_error"
+    assert calls["count"] == 2  # not served from cache - a real request each time
+
+
+def test_fetch_pypi_project_other_http_error_is_not_cached(monkeypatch):
+    calls = {"count": 0}
+
+    def fake_urlopen(request, timeout=None):
+        calls["count"] += 1
+        raise urllib.error.HTTPError(request.full_url, 503, "Service Unavailable", None, None)
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    fetch_pypi_project("scikit-learn")
+    fetch_pypi_project("scikit-learn")
+
+    assert calls["count"] == 2
+
+
+def test_fetch_pypi_project_exhausted_429_is_not_cached(monkeypatch):
+    calls = {"count": 0}
+
+    def fake_urlopen(request, timeout=None):
+        calls["count"] += 1
+        raise urllib.error.HTTPError(request.full_url, 429, "Too Many Requests", {}, None)
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    status1, _ = fetch_pypi_project("scikit-learn", min_request_interval=0, max_retries_on_429=0)
+    status2, _ = fetch_pypi_project("scikit-learn", min_request_interval=0, max_retries_on_429=0)
+
+    assert status1 == status2 == "network_error"
+    assert calls["count"] == 2  # each fetch_pypi_project() call re-attempts for real
+
+
+def test_fetch_pypi_project_invalid_json_is_not_cached(monkeypatch):
+    calls = {"count": 0}
+
+    def fake_urlopen(request, timeout=None):
+        calls["count"] += 1
+        return FakeResponse(b"not json{{{")
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    fetch_pypi_project("scikit-learn")
+    fetch_pypi_project("scikit-learn")
+
+    assert calls["count"] == 2
+
+
+def test_fetch_pypi_project_missing_files_key_is_not_cached(monkeypatch):
+    calls = {"count": 0}
+
+    def fake_urlopen(request, timeout=None):
+        calls["count"] += 1
+        return FakeResponse(json.dumps({"name": "scikit-learn"}).encode("utf-8"))
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    fetch_pypi_project("scikit-learn")
+    fetch_pypi_project("scikit-learn")
+
+    assert calls["count"] == 2
+
+
+def test_fetch_pypi_project_unnormalized_name_is_not_cached():
+    """The pre-network PEP 503 validation failure is also invalid_response,
+    so it follows the same never-cached rule - though since it never reaches
+    the network either way, this mainly documents that the function doesn't
+    special-case it into the cache."""
+    status1, data1 = fetch_pypi_project("Not Normalized/../etc")
+    status2, data2 = fetch_pypi_project("Not Normalized/../etc")
+
+    assert status1 == status2 == "invalid_response"
+    assert data1 is data2 is None
+
+
+def test_a_later_call_succeeds_after_a_transient_network_failure(monkeypatch):
+    """The core policy outcome: a transient failure must never permanently
+    poison a distribution name for the rest of the process."""
+    calls = {"count": 0}
+
+    def fake_urlopen(request, timeout=None):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise urllib.error.URLError("connection refused")
+        return FakeResponse(json.dumps({"files": []}).encode("utf-8"))
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    first_status, _ = fetch_pypi_project("scikit-learn")
+    second_status, second_data = fetch_pypi_project("scikit-learn")
+
+    assert first_status == "network_error"
+    assert second_status == "ok"
+    assert second_data == {"files": []}
+    assert calls["count"] == 2
+
+
+def test_ok_response_cached_after_transient_failure_is_still_served_from_cache(monkeypatch):
+    """Once a real "ok" response is obtained, normal caching resumes - the
+    "never cache transient failures" rule doesn't turn off caching
+    permanently for a distribution, only for the failure itself."""
+    calls = {"count": 0}
+
+    def fake_urlopen(request, timeout=None):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise urllib.error.URLError("connection refused")
+        return FakeResponse(json.dumps({"files": []}).encode("utf-8"))
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    fetch_pypi_project("scikit-learn")   # network_error, not cached
+    fetch_pypi_project("scikit-learn")   # ok, cached
+    fetch_pypi_project("scikit-learn")   # served from cache
+
+    assert calls["count"] == 2
+
+
+def test_cache_hits_still_never_sleep_under_the_new_caching_policy(monkeypatch):
+    sleep_calls = []
+    monkeypatch.setattr(pypi_retriever.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+
+    def fake_urlopen(request, timeout=None):
+        return FakeResponse(json.dumps({"files": []}).encode("utf-8"))
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    fetch_pypi_project("scikit-learn", min_request_interval=5.0)
+    fetch_pypi_project("scikit-learn", min_request_interval=5.0)  # cache hit
+
+    assert sleep_calls == []
+
+
 def test_retrieve_does_not_repeat_a_pypi_request_for_the_same_distribution(monkeypatch):
     calls = {"count": 0}
 

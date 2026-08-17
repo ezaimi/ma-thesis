@@ -60,7 +60,16 @@ repair_agent:
     temperature: 0.1
     top_p: 0.9
     max_tokens: 700
-    timeout_seconds: 120
+    # 300s is the maximum observed during the CPU-only live pilot
+    # (2026-08-17): the committed 120s timed out twice for the same record
+    # (ID 8) that then succeeded once raised to 300s on the same
+    # CPU-only machine, gemma2:9b at 100% CPU. This is not the expected
+    # response time - it's a conservative ceiling for slow, CPU-only
+    # hardware; faster/GPU hardware should respond well under it. A
+    # timeout never executes an argv (nothing has been validated yet at
+    # that point) and still only costs one bounded retry - see
+    # docs/i4-live-validation.md.
+    timeout_seconds: 300
 
   prompt:
     template: "dependency_repair_v1"

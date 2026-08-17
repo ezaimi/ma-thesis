@@ -209,6 +209,22 @@ def fetch_pypi_project(
     requests for the same project - see docs/rag-design.md §2.4. A cache
     hit returns immediately, before any throttling or 429 handling below.
 
+    **Caching policy - only "ok" and "package_not_found" are cached.**
+    "network_error" and "invalid_response" are never cached, however they
+    arose (connection failure, timeout, non-404/429 HTTP error, an
+    exhausted 429 retry budget, unparseable JSON, a malformed distribution
+    name, or a response missing the expected `files` list) - all of these
+    are treated as possibly transient, so the *next* call for the same
+    distribution always tries again for real rather than replaying a
+    stale failure for the rest of the process's lifetime. "package_not_found"
+    is the one deliberate exception: within one process, a 404 for a given
+    distribution name is treated as stable negative information worth
+    caching (this process never invents a mapping, so the only way a 404
+    would stop being a 404 mid-run is PyPI itself changing, which a single
+    batch run does not need to react to) - see
+    `test_fetch_pypi_project_package_not_found_is_cached` in
+    `tests/test_pypi_retriever.py`.
+
     Rate limiting (docs/rag-design.md §2.4, config/rag_repair.yaml
     `pypi_client.rate_limit`): before the first real HTTP attempt, waits
     (if needed) so at least `min_request_interval` seconds have passed
@@ -224,10 +240,8 @@ def fetch_pypi_project(
         return _pypi_response_cache[distribution_name]
 
     if not _NORMALIZED_NAME_RE.match(distribution_name):
-        result = ("invalid_response", None)
-        if use_cache:
-            _pypi_response_cache[distribution_name] = result
-        return result
+        # invalid_response - never cached, see "Caching policy" above.
+        return "invalid_response", None
 
     interval = DEFAULT_MIN_REQUEST_INTERVAL_SECONDS if min_request_interval is None else min_request_interval
     retries_allowed = DEFAULT_MAX_RETRIES_ON_429 if max_retries_on_429 is None else max_retries_on_429
@@ -274,7 +288,8 @@ def fetch_pypi_project(
                     attempt += 1
                     continue
 
-                result = (
+                # network_error (429, retry budget exhausted) - never cached.
+                return (
                     "network_error",
                     {
                         "reason": "rate_limited",
@@ -283,33 +298,24 @@ def fetch_pypi_project(
                         "max_retries": retries_allowed,
                     },
                 )
-                if use_cache:
-                    _pypi_response_cache[distribution_name] = result
-                return result
 
-            result = ("network_error", None)
-            if use_cache:
-                _pypi_response_cache[distribution_name] = result
-            return result
+            # network_error (any other HTTP status) - never cached.
+            return "network_error", None
         except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError):
-            result = ("network_error", None)
-            if use_cache:
-                _pypi_response_cache[distribution_name] = result
-            return result
+            # network_error (connection failure/timeout) - never cached.
+            return "network_error", None
 
     try:
         data = json.loads(raw_body)
     except (json.JSONDecodeError, UnicodeDecodeError):
-        result = ("invalid_response", None)
-        if use_cache:
-            _pypi_response_cache[distribution_name] = result
-        return result
+        # invalid_response - never cached.
+        return "invalid_response", None
 
     if not isinstance(data, dict) or not isinstance(data.get("files"), list):
-        result = ("invalid_response", None)
-    else:
-        result = ("ok", data)
+        # invalid_response - never cached.
+        return "invalid_response", None
 
+    result = ("ok", data)
     if use_cache:
         _pypi_response_cache[distribution_name] = result
     return result

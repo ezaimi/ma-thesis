@@ -45,16 +45,24 @@ unrecognised import name with no verified distribution mapping, such as `dms_var
 `scope_status` - see `docs/architecture-note.md` §7.1 and the "i4 scope clarification" note in
 `docs/prompts.md`.
 
-As of this writing, no orchestrator or `RAGRepairAgent` entry point exists yet in the repository
-(`scripts/rag_repair_agent.py` is planned but not yet implemented; `scripts/pypi_retriever.py`
-currently implements only import-name mapping resolution). When the entry point is built, it -
-or the orchestrator calling it - must check `scope_status == "usable"` before calling it, using
-the field now carried through `data/context-classification/dependency_error_contexts.jsonl` (i2)
-and `data/llm-explanations/explanation_results.jsonl`'s `input.scope_status` (i3). Excluded
-records should still produce a `repair_attempts`-style outcome value that distinguishes "repair
-was never attempted because the record is out of the pip-only scope" from "repair was attempted
-and returned `none`" - the exact field name and value are left to the i4/O4 implementation, since
-the `repair_attempts` table (§6.2 of `docs/architecture-note.md`) does not yet define one.
+**Update - both are now implemented (i4).** The paragraph above described the state before this
+component existed; it no longer does. `scripts/pypi_retriever.py` implements the full deterministic
+retriever - PyPI Simple API retrieval, candidate filtering, in-memory caching, rate-limit handling,
+and (for `wrong_version`) API-compatibility-evidence intersection - not merely import-name mapping
+(§2.3, §2.4). `scripts/rag_repair_agent.py` implements the actual `RAGRepairAgent` entry point:
+the `scope_status == "usable"` eligibility gate described above, prompt rendering, the Ollama call,
+strict schema validation, deterministic grounding validation, bounded retry, and deterministic argv
+construction (§2.5). Both were exercised against real PyPI and a real local Ollama model in a
+three-record live pilot - see `docs/i4-live-validation.md`.
+
+What remains true from the original paragraph: `scripts/rag_repair_agent.py`'s eligibility gate
+still only checks `scope_status`, reading the same field carried through
+`data/context-classification/dependency_error_contexts.jsonl` (i2), and excluded records still only
+produce an abstention inside the agent's own result object (§2.5's `eligibility`/`status` fields) -
+**FixApplicator and ResultLogger remain unimplemented**, so no `repair_attempts` table row, RDF
+triple, or persisted outcome exists yet for any record, repair-eligible or not. i4 produces
+validated *proposals* - a grounded, safe-to-execute argument list - never a verified repair; nothing
+in this repository has installed a package, modified a container, or rerun a notebook.
 
 ### 2.2 Grounded API-compatibility evidence for `wrong_version` (i4)
 

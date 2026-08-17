@@ -41,6 +41,14 @@ def config():
     return load_rag_repair_config()
 
 
+def test_configured_ollama_timeout_is_300_seconds(config):
+    """300s (raised from the originally committed 120s) is the maximum
+    observed during the 2026-08-17 CPU-only live pilot, where 120s timed
+    out twice for the same record that then succeeded at 300s - see
+    docs/i4-live-validation.md. Not the expected response time, a ceiling."""
+    assert config["repair_agent"]["ollama"]["timeout_seconds"] == 300
+
+
 class FakeResponse:
     def __init__(self, body: bytes):
         self._body = body
