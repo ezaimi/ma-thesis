@@ -18,6 +18,14 @@ dependency files) for later use by the LLM explanation/repair prompts.
 - `data/context-classification/classification_summary.json` - counts and distributions
 - `data/context-classification/manual_validation_sample.csv` - stratified sample for manual agreement checks
 
+Every enriched record carries three fields through unchanged from the i1 CSV: `scope_status`
+(`usable` / `excluded`), `exclusion_reason`, and `split` (`dev` / `evaluation` / `excluded`). These
+are i1's repair-eligibility classification, not part of i2's own subtype refinement - i2 still
+enriches and writes a record for every i1 row regardless of `scope_status`. The fields exist so
+that a later `RAGRepairAgent` (i4) can decide whether to attempt repair without re-deriving
+eligibility, while `LLMExplainer` (i3) continues to explain every row. See
+`docs/architecture-note.md` §7.1 for the full explanation-vs-repair scope split.
+
 ## Classifier Rules
 
 Subtypes reuse the i1 taxonomy: `missing_package`, `wrong_version`, `system_library`,

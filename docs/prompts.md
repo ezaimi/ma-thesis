@@ -36,6 +36,11 @@ The explanation component and repair component remain separate:
 - `LLMExplainer` produces a plain-language explanation;
 - `RAGRepairAgent` produces a structured repair proposal.
 
+The pip-only v1 scope listed above governs `RAGRepairAgent` only. `LLMExplainer` is not
+restricted to this scope: it explains every `DEPENDENCY_ERROR` row, including system-library and
+ambiguous-local-module cases that `RAGRepairAgent` will never attempt to repair. See "i4 scope
+clarification" at the end of this document and `docs/architecture-note.md` §7.1.
+
 ## 3. Model Candidates
 
 This thesis shortlists open LLMs for the L4 prompt-design stage. The models are selected for two tasks:
@@ -784,3 +789,35 @@ This separation prevents raw input metadata, such as original error messages, fr
 ### Scope boundary
 
 The LLMExplainer only explains dependency-related failures. It does not generate, apply, or validate fixes. Repair generation remains assigned to the later RAGRepairAgent/FixApplicator components.
+
+### i4 scope clarification: explanation covers all 214 rows, repair covers 200
+
+Made explicit while implementing i4 (`RAGRepairAgent`), because that is the first component whose
+correctness depends on the answer.
+
+`LLMExplainer` processes every `DEPENDENCY_ERROR` row - all 214, across all four subtypes
+(`missing_package`, `wrong_version`, `system_library`, `mapping_unknown`) - matching the Vision
+Doc's O1 definition, which is scoped to "a dependency-related error message" with no
+pip-fixability qualifier. The "v1 repair scope" language throughout L4 (§2, §6) and in
+`docs/dataset.md` was always about repair eligibility, not explanation eligibility; it is
+restated here because earlier drafts of `docs/architecture-note.md` and `thesis/architecture.tex`
+gated `LLMExplainer` behind the same "in scope" signal as `RAGRepairAgent`, which read as a
+stricter shared gate than the objective actually states.
+
+Concretely:
+
+- `RAGRepairAgent` and `FixApplicator` (O2/O3) operate only on rows where `scope_status ==
+  "usable"` (200 of 214) - unchanged from the original pip-only v1 scope.
+- `LLMExplainer` (O1) has no such filter, in the prompt template or in the runner. The i3
+  acceptance criteria never restricted it to pip-fixable rows, and the shipped prompt template
+  (`prompts/dependency_explanation_v1.txt`) already lists `system_level_dependency` and
+  `local_import_or_path_issue` - the root-cause hints for the two excluded subtypes - as known
+  values, confirming this was the template's intent even before the scope conflict was written
+  down explicitly.
+- `scope_status`, `exclusion_reason`, and `split` are threaded through i2's enriched JSONL and
+  into i3's logged `input` block purely for traceability and later filtering - the explanation
+  prompt itself is not given a reason to treat excluded subtypes differently, since it must not
+  claim repairability for any subtype regardless (`schemas/explanation.schema.json` has no
+  fix/command/version field).
+- The 13 `dev`-split rows (used to design and sanity-check both prompts in L4) must not be scored
+  in a final explanation-quality evaluation, separately from the pip-scope question above.

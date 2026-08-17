@@ -204,7 +204,7 @@ def find_legacy_hint(connection, notebook_id, error_type, error_message, failing
 
     return None, rejected
 
-
+# reads repository paths, commits and dependency-file locations from the database
 def load_repository_metadata(connection):
     try:
         rows = connection.execute(
@@ -225,11 +225,11 @@ def load_repository_metadata(connection):
         for row in rows
     }
 
-
+# creates a raw GitHub URL
 def build_raw_url(repository, ref, path):
     return f"{RAW_GITHUB_BASE}/{repository}/{ref}/{path}"
 
-
+# downloads text from that URL
 def fetch_text(url):
     try:
         with urllib.request.urlopen(url, timeout=FETCH_TIMEOUT_SECONDS) as response:
@@ -239,9 +239,9 @@ def fetch_text(url):
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError, OSError):
         return None
 
-
+# tries the recorded commit, then main, then master
 def fetch_with_ref_fallback(repository, path, commit):
-    """Try the recorded commit first, then main, then master. Never raises."""
+   
     if not repository or not path:
         return None, None
 
@@ -257,14 +257,14 @@ def fetch_with_ref_fallback(repository, path, commit):
 
     return None, None
 
-
+# converts a notebook cell’s source into one string
 def cell_source_text(cell):
     source = cell.get("source", "")
     if isinstance(source, list):
         return "".join(source)
     return source or ""
 
-
+# → What code was the notebook executing?
 def extract_notebook_context(notebook_text, error_cell_index):
     """Extract failing/import/surrounding cells from a fetched .ipynb JSON.
 
@@ -308,7 +308,7 @@ def extract_notebook_context(notebook_text, error_cell_index):
         "surrounding_cells": surrounding_cells,
     }
 
-
+# → What packages and versions did the repository declare?
 def fetch_dependency_files(repository, commit, path_field_value):
     if not path_field_value:
         return []
@@ -327,7 +327,7 @@ def fetch_dependency_files(repository, commit, path_field_value):
         })
     return results
 
-
+# collects the information that will later be placed in the LLM prompt
 def build_prompt_context(row, refined_subtype, confidence, root_cause_hint,
                           legacy_hint, remote_context, dependency_files, context_status):
     return {
@@ -417,6 +417,9 @@ def enrich_row(row, connection, repo_meta_by_id, fetch_remote):
         "failing_module": failing_module,
         "original_subtype": original_subtype,
         "refined_subtype": refined_subtype,
+        "scope_status": row.get("scope_status"),
+        "exclusion_reason": row.get("exclusion_reason"),
+        "split": row.get("split"),
         "confidence": confidence,
         "root_cause_hint": root_cause_hint,
         "context_status": context_status,
@@ -428,7 +431,7 @@ def enrich_row(row, connection, repo_meta_by_id, fetch_remote):
     result.update(normalize_error_fields(row.get("error_type"), row.get("error_message"), failing_module))
     return result
 
-
+# produces a safe basic record if normal enrichment crashes
 def fallback_metadata_only(row, error):
     print(
         f"[WARN] Falling back to metadata_only for "
@@ -451,6 +454,9 @@ def fallback_metadata_only(row, error):
         "failing_module": failing_module,
         "original_subtype": original_subtype,
         "refined_subtype": original_subtype,
+        "scope_status": row.get("scope_status"),
+        "exclusion_reason": row.get("exclusion_reason"),
+        "split": row.get("split"),
         "confidence": "low",
         "root_cause_hint": "insufficient_context",
         "context_status": "metadata_only",
@@ -474,7 +480,7 @@ def fallback_metadata_only(row, error):
     result.update(normalize_error_fields(row.get("error_type"), row.get("error_message"), failing_module))
     return result
 
-
+# selects rows from each subtype for manual review: 5 nga nje subtype, 10 nga nje tjeter
 def stratified_sample(enriched_rows):
     """Deterministic stratified sample, taking the first N rows per subtype
     in dataset order (no randomness, for reproducibility)."""
@@ -488,7 +494,7 @@ def stratified_sample(enriched_rows):
         sample.extend(items if limit is None else items[:limit])
     return sample
 
-
+# krijon manual_validation_sample.csv
 def write_validation_sample(sample_rows):
     with VALIDATION_SAMPLE_PATH.open("w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=VALIDATION_SAMPLE_COLUMNS)
@@ -508,7 +514,7 @@ def write_validation_sample(sample_rows):
                 "notes": "",
             })
 
-
+# calculates classification and context statistics
 def build_summary(enriched_rows, sample_rows, fetch_remote):
     context_status_counts = Counter(r["context_status"] for r in enriched_rows)
     dependency_files_attempted = sum(len(r["dependency_file_metadata"]) for r in enriched_rows)
@@ -558,6 +564,14 @@ dependency files) for later use by the LLM explanation/repair prompts.
 - `data/context-classification/dependency_error_contexts.jsonl` - one enriched record per i1 row
 - `data/context-classification/classification_summary.json` - counts and distributions
 - `data/context-classification/manual_validation_sample.csv` - stratified sample for manual agreement checks
+
+Every enriched record carries three fields through unchanged from the i1 CSV: `scope_status`
+(`usable` / `excluded`), `exclusion_reason`, and `split` (`dev` / `evaluation` / `excluded`). These
+are i1's repair-eligibility classification, not part of i2's own subtype refinement - i2 still
+enriches and writes a record for every i1 row regardless of `scope_status`. The fields exist so
+that a later `RAGRepairAgent` (i4) can decide whether to attempt repair without re-deriving
+eligibility, while `LLMExplainer` (i3) continues to explain every row. See
+`docs/architecture-note.md` §7.1 for the full explanation-vs-repair scope split.
 
 ## Classifier Rules
 

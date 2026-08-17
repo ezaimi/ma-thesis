@@ -29,6 +29,33 @@ When a package mapping, compatible version, or API-level compatibility cannot be
 
 L5 does not implement the production HTTP retriever, apply repairs, or rerun notebooks. Those activities belong to later implementation and evaluation stages.
 
+### 2.1 Repair-eligibility gate (i4 entry contract)
+
+`RAGRepairAgent` must only be invoked for records where the upstream classification carries
+`scope_status == "usable"`. This is a precondition on whether the component runs at all, and is
+distinct from the `mapping_unknown` / `package_not_found` / `no_compatible_release` retrieval
+statuses in §6 and §9, which describe what the retriever does *after* it has already been invoked
+on an eligible record but cannot safely resolve it. Do not confuse the two: `scope_status` is i1's
+repair-eligibility classification (`missing_package`/`wrong_version` -> `usable`;
+`system_library`/`mapping_unknown` -> `excluded`); L5's own `mapping_unknown` retrieval status is
+a narrower, PyPI-resolution-time outcome that can occur even for a `usable` row (e.g. an
+unrecognised import name with no verified distribution mapping, such as `dms_variants`).
+
+`LLMExplainer` (O1) has no such gate and explains every `DEPENDENCY_ERROR` row regardless of
+`scope_status` - see `docs/architecture-note.md` §7.1 and the "i4 scope clarification" note in
+`docs/prompts.md`.
+
+As of this writing, no orchestrator or `RAGRepairAgent` entry point exists yet in the repository
+(`scripts/rag_repair_agent.py` is planned but not yet implemented; `scripts/pypi_retriever.py`
+currently implements only import-name mapping resolution). When the entry point is built, it -
+or the orchestrator calling it - must check `scope_status == "usable"` before calling it, using
+the field now carried through `data/context-classification/dependency_error_contexts.jsonl` (i2)
+and `data/llm-explanations/explanation_results.jsonl`'s `input.scope_status` (i3). Excluded
+records should still produce a `repair_attempts`-style outcome value that distinguishes "repair
+was never attempted because the record is out of the pip-only scope" from "repair was attempted
+and returned `none`" - the exact field name and value are left to the i4/O4 implementation, since
+the `repair_attempts` table (§6.2 of `docs/architecture-note.md`) does not yet define one.
+
 
 
 ## 3. Import Name Resolution Policy

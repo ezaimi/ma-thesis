@@ -97,6 +97,41 @@ def test_legacy_traceback_hint_dict_unwraps_raw_traceback():
     assert values["legacy_traceback_hint"] == "Traceback text here"
 
 
+def test_system_library_record_renders_through_the_real_explanation_template():
+    """LLMExplainer must be able to render an explanation prompt for an
+    excluded (system_library) subtype, since explanation scope covers all
+    214 DEPENDENCY_ERROR rows and repair eligibility (scope_status) is a
+    separate, downstream concern. See docs/architecture-note.md §7.1."""
+    from render_explanation_prompt import render_record_prompt
+
+    record = sample_record()
+    record.update({
+        "notebook_execution_id": 15,
+        "error_type": "ImportError",
+        "error_message": "libxcb.so.1: cannot open shared object file: No such file or directory",
+        "original_subtype": "system_library",
+        "refined_subtype": "system_library",
+        "confidence": "high",
+        "root_cause_hint": "system_level_dependency",
+        "failing_module": "libxcb.so.1",
+        "scope_status": "excluded",
+        "exclusion_reason": "requires system library, outside pip-only scope",
+        "split": "excluded",
+    })
+
+    template_path = ROOT / "prompts" / "dependency_explanation_v1.txt"
+    template = template_path.read_text(encoding="utf-8")
+
+    prompt = render_record_prompt(record, template)
+
+    assert "{{" not in prompt
+    assert "libxcb.so.1" in prompt
+    assert "system_level_dependency" in prompt
+    # The explainer must never be told to withhold an explanation because of
+    # repair eligibility - scope_status is not one of the template's slots.
+    assert "scope_status" not in prompt
+
+
 def test_iter_rendered_prompts_preserves_record_on_render_failure(tmp_path):
     from render_explanation_prompt import iter_rendered_prompts
 

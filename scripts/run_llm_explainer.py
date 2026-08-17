@@ -40,9 +40,11 @@ def truncate_text(value: str, max_chars: int = MAX_RAW_RESPONSE_CHARS) -> str:
 def should_retry(category: str, attempt: int, max_retries: int, retry_on: List[str]) -> bool:
     return attempt < max_retries and category in retry_on
 
-
+# sends the prompt to the local Ollama server, model: gemma2:9b
+# stream false meaning Ollama returns the complete answer at once
+# returns raw_response(explanation produces by Gemma) & ollama_metadata(token counts and other ollama info)
 def call_ollama(
-    model: str,
+    model: str, 
     prompt: str,
     generation_config: Dict[str, Any]
 ) -> Tuple[str, Dict[str, Any]]:
@@ -101,7 +103,8 @@ def classify_validation_error(errors: List[str]) -> str:
         return "invalid_json"
     return "schema_validation_error"
 
-
+# controls the entire process for one prompt
+# calls ollama (call_ollama) and then receives the raw response
 def explain_one(
     prompt: str,
     config: Dict[str, Any],
@@ -204,6 +207,9 @@ def build_input_metadata(record: Dict[str, Any]) -> Dict[str, Any]:
         "failing_module": record.get("failing_module"),
         "original_subtype": record.get("original_subtype"),
         "refined_subtype": record.get("refined_subtype"),
+        "scope_status": record.get("scope_status"),
+        "exclusion_reason": record.get("exclusion_reason"),
+        "split": record.get("split"),
         "classifier_confidence": record.get("confidence"),
         "root_cause_hint": record.get("root_cause_hint"),
         "context_status": record.get("context_status"),
@@ -219,7 +225,7 @@ def build_llm_metadata(config: Dict[str, Any]) -> Dict[str, Any]:
         "prompt_version": config["prompt"]["version"],
     }
 
-
+# saves the explanation result
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run LLM explanations over i2-classified dependency errors."

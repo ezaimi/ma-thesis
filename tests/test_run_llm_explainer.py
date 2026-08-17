@@ -173,6 +173,53 @@ def test_retry_on_config_gates_retries(monkeypatch):
     assert calls["count"] == 1
 
 
+def test_build_input_metadata_preserves_scope_fields():
+    record = {
+        "notebook_execution_id": 15,
+        "error_type": "ImportError",
+        "error_message": "libxcb.so.1: cannot open shared object file: No such file or directory",
+        "failing_module": "libxcb.so.1",
+        "original_subtype": "system_library",
+        "refined_subtype": "system_library",
+        "scope_status": "excluded",
+        "exclusion_reason": "requires system library, outside pip-only scope",
+        "split": "excluded",
+        "confidence": "high",
+        "root_cause_hint": "system_level_dependency",
+        "context_status": "metadata_only",
+        "error_cell_index": "8",
+    }
+
+    metadata = run_llm_explainer.build_input_metadata(record)
+
+    assert metadata["scope_status"] == "excluded"
+    assert metadata["exclusion_reason"] == "requires system library, outside pip-only scope"
+    assert metadata["split"] == "excluded"
+
+
+def test_build_input_metadata_preserves_scope_fields_for_usable_row():
+    record = {
+        "notebook_execution_id": 8,
+        "error_type": "ModuleNotFoundError",
+        "error_message": "No module named 'sklearn'",
+        "failing_module": "sklearn",
+        "original_subtype": "missing_package",
+        "refined_subtype": "missing_package",
+        "scope_status": "usable",
+        "exclusion_reason": "",
+        "split": "dev",
+        "confidence": "high",
+        "root_cause_hint": "import_distribution_name_mismatch",
+        "context_status": "metadata_only",
+        "error_cell_index": "5",
+    }
+
+    metadata = run_llm_explainer.build_input_metadata(record)
+
+    assert metadata["scope_status"] == "usable"
+    assert metadata["split"] == "dev"
+
+
 def test_main_writes_nested_output_with_mocked_ollama(monkeypatch, tmp_path):
     input_path = tmp_path / "input.jsonl"
     output_path = tmp_path / "output.jsonl"
@@ -238,6 +285,84 @@ def test_main_writes_nested_output_with_mocked_ollama(monkeypatch, tmp_path):
     assert row["llm"]["llm_model"] == "gemma2:9b"
     assert row["explanation_result"]["status"] == "success"
     assert row["explanation_result"]["explanation_json"]["failing_module"] == "sklearn"
+
+
+def test_main_does_not_filter_excluded_subtypes_from_explanation(monkeypatch, tmp_path):
+    """The runner must explain every DEPENDENCY_ERROR row it is given,
+    regardless of scope_status - repair eligibility is a downstream (i4)
+    concern, not an explanation-time filter. See docs/architecture-note.md
+    §7.1 and docs/prompts.md "i4 scope clarification"."""
+    input_path = tmp_path / "input.jsonl"
+    output_path = tmp_path / "output.jsonl"
+
+    rows = [
+        {
+            "notebook_execution_id": 8,
+            "error_type": "ModuleNotFoundError",
+            "error_message": "No module named 'sklearn'",
+            "original_subtype": "missing_package",
+            "refined_subtype": "missing_package",
+            "scope_status": "usable",
+            "exclusion_reason": "",
+            "split": "dev",
+            "confidence": "high",
+            "root_cause_hint": "import_distribution_name_mismatch",
+            "failing_module": "sklearn",
+            "context_status": "metadata_only",
+            "error_cell_index": "5",
+            "prompt_context": {},
+            "legacy_traceback_hint": None
+        },
+        {
+            "notebook_execution_id": 15,
+            "error_type": "ImportError",
+            "error_message": "libxcb.so.1: cannot open shared object file: No such file or directory",
+            "original_subtype": "system_library",
+            "refined_subtype": "system_library",
+            "scope_status": "excluded",
+            "exclusion_reason": "requires system library, outside pip-only scope",
+            "split": "excluded",
+            "confidence": "high",
+            "root_cause_hint": "system_level_dependency",
+            "failing_module": "libxcb.so.1",
+            "context_status": "metadata_only",
+            "error_cell_index": "8",
+            "prompt_context": {},
+            "legacy_traceback_hint": None
+        }
+    ]
+
+    input_path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+
+    def fake_call_ollama(model, prompt, generation_config):
+        return json.dumps(valid_response()), {"prompt_eval_count": 10, "eval_count": 20}
+
+    monkeypatch.setattr(run_llm_explainer, "call_ollama", fake_call_ollama)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_llm_explainer.py",
+            "--input", str(input_path),
+            "--output", str(output_path),
+            "--limit", "10",
+            "--overwrite"
+        ]
+    )
+
+    run_llm_explainer.main()
+
+    lines = output_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 2
+
+    results = [json.loads(line) for line in lines]
+    statuses = {r["explanation_result"]["status"] for r in results}
+    assert statuses == {"success"}
+
+    excluded_result = next(r for r in results if r["input"]["notebook_execution_id"] == 15)
+    assert excluded_result["input"]["scope_status"] == "excluded"
+    assert excluded_result["input"]["exclusion_reason"] == "requires system library, outside pip-only scope"
+    assert excluded_result["explanation_result"]["status"] == "success"
 
 
 def test_main_writes_render_failed_row(monkeypatch, tmp_path):
