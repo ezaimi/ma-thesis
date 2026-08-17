@@ -21,3 +21,34 @@
 
 runtime:
   python_version: "3.10"
+
+# RAGRepairAgent (i4) settings. Mirrors config/llm_explainer.yaml's shape
+# and reuses the same model (Gemma-2 9B via Ollama) - the L4 decision
+# (docs/prompts.md §5) was to share one model between LLMExplainer and
+# RAGRepairAgent so a later baseline evaluation isn't confounded by mixing
+# model effects between the two components.
+repair_agent:
+  ollama:
+    url: "http://localhost:11434/api/generate"
+    model: "gemma2:9b"
+    temperature: 0.1
+    top_p: 0.9
+    max_tokens: 700
+    timeout_seconds: 120
+
+  prompt:
+    template: "dependency_repair_v1"
+    version: "i4_prompt_v1"
+
+  retry:
+    max_retries: 1
+    retry_on:
+      - invalid_json
+      - schema_validation_error
+      - grounding_validation_error
+      - timeout
+      - model_unavailable
+
+  output:
+    path: "data/repair-proposals/repair_proposals.jsonl"
+    schema: "schemas/repair_proposal.schema.json"

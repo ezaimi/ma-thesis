@@ -134,13 +134,83 @@ This module only proposes. It does not run `pip`, does not modify a notebook's e
 does not confirm that a proposed pin actually resolves the original error - that confirmation is
 FixApplicator's job (a later step, out of scope here), via re-execution.
 
-**Implemented now vs. planned.** As of this writing, step 1 (the deterministic retriever) is fully
-implemented in `scripts/pypi_retriever.py` and `scripts/compatibility_evidence.py`, including the
-`wrong_version` compatibility-evidence intersection - see §2.3 below for its exact contract. Steps
-2-4 (the LLM proposal, the deterministic validator, and the command builder) remain design only:
-`scripts/rag_repair_agent.py` does not exist yet. `retrieve()`'s output (§2.3) is exactly the
-"grounded candidate set" step 2 is meant to receive - implementing `rag_repair_agent.py` against
-that output is the remaining work.
+**Implemented now vs. planned.** As of this writing, all four steps are implemented: step 1 (the
+deterministic retriever) in `scripts/pypi_retriever.py` and `scripts/compatibility_evidence.py`
+(§2.3); steps 2-4 (the LLM proposal, the deterministic validator, and the command builder) in
+`scripts/rag_repair_agent.py` and `scripts/repair_proposal_validator.py` - see §2.5 below for the
+exact contract. What remains unimplemented is FixApplicator: nothing in this component runs `pip`,
+executes the constructed argv, modifies a notebook's environment, or reruns a notebook. A proposal
+this component produces is a grounded, validated recommendation only, never a confirmed repair.
+
+### 2.5 `RAGRepairAgent` - implemented contract (i4)
+
+`scripts/rag_repair_agent.run_repair_agent(record, config)` implements §2.2's four-layer role
+contract end to end for one enriched i2 record.
+
+**Repair-eligibility gate (before any retrieval or LLM call):** `record["scope_status"]`:
+
+- `"usable"` -> continue.
+- `"excluded"` -> abstain (`action: "none"`), preserving `exclusion_reason`; zero PyPI/LLM calls.
+- anything else (missing, `null`, an unrecognized value) -> abstain as `"invalid"`; the gate never
+  assumes eligibility just because the value isn't literally `"excluded"`. `split` (dev/evaluation)
+  never influences this decision - it is evaluation metadata only, per §7.1 of
+  `docs/architecture-note.md`.
+
+**Deterministic signature extraction (`wrong_version` only):** `cannot import name 'X' from 'Y'`
+is parsed with a fixed regex - never the LLM - into `(module_path, symbol) = (Y, X)`. A message
+that doesn't match this shape means immediate abstention, before any PyPI or LLM call.
+
+**LLM proposal schema** (`schemas/repair_proposal.schema.json`, strict, `additionalProperties:
+false`): exactly `action` (`install | pin_version | none`), `install_name` (string or null),
+`version` (string or null), `rationale` (non-empty string) - action-conditional nullability
+enforced via the schema's own `if`/`then` rules. This is deliberately narrower than the
+6-field sketch in `docs/prompts.md`'s original L4 template (which also had the model return
+`import_name` and `pypi_evidence`); see that document's own i4 correction note for why those two
+fields were dropped from what the model is asked to produce.
+
+**Deterministic grounding validation** (`scripts/repair_proposal_validator.validate_grounding()`),
+after schema validation passes: the schema only proves *shape*: this step proves the *content* is
+grounded. `install_name` must exactly equal the distribution `retrieve()` itself resolved - never
+merely "look similar". A `pin_version` proposal's `version` must exactly equal one entry already
+present in `candidate_versions` - not a range, not a nearby version. A `missing_package` `install`
+proposal additionally requires at least one `python_compatibility: "compatible"` candidate (closing
+the "compatible/unknown share one list" gap noted in §2.3). `wrong_version` additionally requires
+`compatibility_evidence.status == "resolved"`. Every checked field is also run through
+`is_safe_token()` - a narrow allowlist (`^[A-Za-z0-9][A-Za-z0-9._-]*$`) rejecting a leading `-`,
+whitespace, control characters, and shell metacharacters - as a second, independent layer beneath
+the exact-match requirement. Any single failure discards the entire proposal; nothing is
+"corrected" to a safe value - the outcome is always a full abstention.
+
+**Retry:** at most one retry (two calls total), for `invalid_json`, `schema_validation_error`,
+`grounding_validation_error` (new relative to i3 - a `RAGRepairAgent`-specific category that
+resubmits the model's proposal along with why it wasn't grounded), `timeout`, or
+`model_unavailable`, matching `config/rag_repair.yaml`'s `repair_agent.retry` block. Exhausting
+retries always yields `action: "none"`.
+
+**Deterministic argv construction** (`scripts/rag_repair_agent.build_argv()`), only after grounding
+validation passes: `["python", "-m", "pip", "install", install_name]` for `install`, or
+`["python", "-m", "pip", "install", f"{install_name}=={version}"]` for `pin_version`; `None` for
+`none`. A list, never a shell string; nothing in this module invokes a shell or calls `subprocess`.
+A separate `command` field (a plain-text join of the same argv) is included for logging only and
+is explicitly documented as non-executable.
+
+**Result structure:** one JSON object per input record (`run_id`, `created_at`,
+`notebook_execution_id`, `input` metadata, `eligibility`, `extracted_signature`,
+`retrieval_result`, `llm`, `raw_response`, `proposal`, `schema_validation`, `grounding_validation`,
+`final_action`/`final_install_name`/`final_version`/`final_rationale`, `argv`, `command`,
+`attempts`, `errors`, `status`), regardless of how many internal LLM attempts it took.
+`status` is `"success"` (a grounded `install`/`pin_version` proposal), `"abstained"` (a legitimate
+`none` - by design, by the LLM, or by a rejected grounding check), or `"failed"` (every LLM attempt
+was exhausted without ever producing a parseable, schema-valid response - a communication/format
+failure, not a considered abstention).
+
+**Batch runner:** `scripts/rag_repair_agent.py`'s `main()` mirrors
+`scripts/run_llm_explainer.py`'s CLI shape exactly - `--input` (default
+`data/context-classification/dependency_error_contexts.jsonl`), `--output` (default
+`data/repair-proposals/repair_proposals.jsonl`), `--start-index`, `--limit` (default 5),
+`--overwrite` (append is the default, matching i3). It was not run against the real dataset as
+part of this step - see the accompanying commit's final report for why, and for what a real run
+would require.
 
 ### 2.3 `retrieve()` - implemented contract (i4)
 

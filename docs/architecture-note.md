@@ -215,7 +215,7 @@ The pip-only v1 restriction governs **repair eligibility only**, not explanation
 | Objective | Realized by | Status after L3 |
 |---|---|---|
 | O1 — Error explanation | LLMExplainer | designed |
-| O2 — Fix generation (PyPI RAG) | RAGRepairAgent + fix object (§6.1) | designed (RAG internals → L5) |
+| O2 — Fix generation (PyPI RAG) | RAGRepairAgent + fix object (§6.1) | implemented (i4): `scripts/rag_repair_agent.py`, `scripts/pypi_retriever.py`, `scripts/compatibility_evidence.py` produce a validated, grounded fix object; FixApplicator (O3) still does not exist, so no proposal has been executed or confirmed |
 | O3 — Fix validation | FixApplicator (re-run in container) | designed |
 | O4 — Benchmark dataset | `repair_attempts` table (§6.2) | schema designed |
 | O5 — Pipeline integration | orchestrator + hook-in (§3, §5) | designed |

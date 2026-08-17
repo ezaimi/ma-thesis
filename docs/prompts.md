@@ -447,6 +447,26 @@ container. The corrected contract:
 See `docs/rag-design.md` §2.2 for the full retrieval -> proposal -> validation -> command-construction
 sequence, and the "implemented vs. planned" note there for what actually exists in code today.
 
+### Implemented schema correction (i4)
+
+The zero-shot template below (from L4) has the model return six fields: `action`, `import_name`,
+`install_name`, `version`, `rationale`, `pypi_evidence`. The actual i4 implementation
+(`schemas/repair_proposal.schema.json`, `prompts/dependency_repair_v1.txt`) narrows this to exactly
+four: `action`, `install_name`, `version`, `rationale`, with `additionalProperties: false`. Two
+fields were deliberately dropped from what the model produces:
+
+- `import_name` - already known before the LLM is ever called (it's the deterministically resolved
+  input, not something requiring judgment); echoing it back proves nothing and was never checked
+  against anything.
+- `pypi_evidence` - re-stating retrieval data invites drift between what was actually retrieved and
+  what the model claims was retrieved. The final logged fix object still carries `pypi_evidence`
+  (§6.1) - it is populated by deterministic code straight from the retrieval result, never from the
+  model's own echo.
+
+This is a narrowing, not a contradiction of intent: the template below remains valid documentation
+of the original L4 prompt-design work; the four-field schema is what `RAGRepairAgent` actually
+validates against. See `docs/rag-design.md` §2.5 for the full implemented contract.
+
 ### Zero-shot prompt template
 
 ```text

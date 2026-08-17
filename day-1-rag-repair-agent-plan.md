@@ -407,6 +407,17 @@ The retrieval function always returns the same top-level schema, including when 
 
 ## 11. Step 8 — Build the Structured Fix Suggestion
 
+**Implemented (i4), with two deviations from this section's sketch:** (1) the entry point is
+`run_repair_agent(record, config)` - it takes the full enriched i2 record and the loaded
+`config/rag_repair.yaml`, not the bare `(import_name, python_version, subtype)` shown below,
+because it also runs the eligibility gate, signature extraction, and LLM call this section assumed
+were already handled elsewhere. (2) the fix suggestion now genuinely goes through an LLM proposal
+(`prompts/dependency_repair_v1.txt`) plus a separate deterministic grounding check
+(`scripts/repair_proposal_validator.py`), not a single deterministic `suggest_fix()` - the "safe
+success/failure behaviour" and the `command`-from-validated-fields invariant below are both still
+exactly honored, just split across `rag_repair_agent.py` and `repair_proposal_validator.py`. See
+`docs/rag-design.md` §2.5 for the current, authoritative contract.
+
 Implement the RAGRepairAgent entry point in `scripts/rag_repair_agent.py`, for example:
 
 ```python
