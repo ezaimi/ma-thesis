@@ -476,7 +476,7 @@ if result["action"] == "none":
 
 For `wrong_version`, PyPI's Python compatibility alone does not prove which historical release contains the API required by the notebook. Do not guess an older version. Return `action: "none"` unless the existing RAG design provides additional grounded evidence for choosing it.
 
-**Update:** that additional grounded evidence now exists for a curated set of patterns. `scripts/compatibility_evidence.py` (`lookup_compatibility_evidence`, `filter_versions_by_compatibility_evidence`) checks `config/api_compatibility_evidence.yaml`, a hand-verified registry of official release-notes/changelog boundaries, and intersects it with PyPI's safe candidate versions. Only versions surviving that intersection may ever be proposed as `pin_version`; everything else still returns `none`. As of this writing the registry covers exactly the three unique `wrong_version` patterns present in the dataset (`scipy.integrate.cumtrapz`, `scipy.sparse.sputils.isshape`, `numpy.VisibleDeprecationWarning` — see `docs/rag-design.md` §2.2). A pattern outside that set still has no grounded evidence and must return `none`, exactly as this section originally specified. `python_version="3.11"` in this document's own worked examples below is stale — the actual Docker execution environment is Python 3.10 (see the i4 design review's Q1 finding); use `"3.10"` when re-running these checkpoints.
+**Update:** that additional grounded evidence now exists for a curated set of patterns. `scripts/compatibility_evidence.py` (`lookup_compatibility_evidence`, `filter_versions_by_compatibility_evidence`) checks `config/api_compatibility_evidence.yaml`, a hand-verified registry of official release-notes/changelog boundaries, and intersects it with PyPI's safe candidate versions. Only versions surviving that intersection may ever be proposed as `pin_version`; everything else still returns `none`. As of this writing the registry covers exactly the three unique `wrong_version` patterns present in the dataset (`scipy.integrate.cumtrapz`, `scipy.sparse.sputils.isshape`, `numpy.VisibleDeprecationWarning` — see `docs/rag-design.md` §2.2). A pattern outside that set still has no grounded evidence and must return `none`, exactly as this section originally specified. The worked examples below now use the authoritative execution-runtime constant, `"3.10"` (`config/rag_repair.yaml`, `runtime.python_version` — see `docs/rag-design.md` §4), not the placeholder `"3.11"` earlier drafts of this checkpoint used.
 
 ### Checkpoint
 
@@ -550,7 +550,7 @@ Example:
 
 ```bash
 PYTHONPATH=scripts python -c \
-"from pypi_retriever import retrieve; print(retrieve('sklearn', '3.11'))"
+"from pypi_retriever import retrieve; print(retrieve('sklearn', '3.10'))"
 ```
 
 Expected retrieval outcomes:
@@ -576,14 +576,14 @@ Test the final fix suggestion:
 
 ```bash
 PYTHONPATH=scripts python -c \
-"from rag_repair_agent import suggest_fix; print(suggest_fix('sklearn', '3.11'))"
+"from rag_repair_agent import suggest_fix; print(suggest_fix('sklearn', '3.10'))"
 ```
 
 Test the unknown-mapping safety path:
 
 ```bash
 PYTHONPATH=scripts python -c \
-"from rag_repair_agent import suggest_fix; print(suggest_fix('dms_variants', '3.11'))"
+"from rag_repair_agent import suggest_fix; print(suggest_fix('dms_variants', '3.10'))"
 ```
 
 The second result must contain:

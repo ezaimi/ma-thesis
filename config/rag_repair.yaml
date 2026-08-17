@@ -1,0 +1,23 @@
+# Runtime configuration for RAGRepairAgent (i4).
+#
+# python_version is NOT looked up per notebook. The upstream Docker pipeline
+# (Sheeba-Samuel/computational-reproducibility-pmc-docker) builds one
+# Dockerfile template for every repository it processes, with the base image
+# hardcoded: `FROM python:3.10-slim` in lib/docker.sh's create_dockerfile(),
+# confirmed again by the hardcoded `python3.10` PYTHONPATH entry in
+# lib/entrypoint.sh. There is no per-repository or per-notebook variation, so
+# every notebook this repair layer processes ran under the same interpreter.
+#
+# Do NOT use the Docker pipeline's `notebooks.language_version` database
+# column as a substitute: that field records each notebook's own, often
+# stale or "unknown", author-time kernelspec metadata - not the version the
+# Docker container actually executes with. Using it would silently
+# substitute the wrong runtime for most notebooks.
+#
+# Any future PyPI retrieval/filtering code (scripts/pypi_retriever.py's
+# retrieve(), once implemented) must read python_version from this file
+# rather than hardcoding it inline or deriving it per row. See
+# docs/rag-design.md §2.2 and §4 for the full contract this value feeds.
+
+runtime:
+  python_version: "3.10"

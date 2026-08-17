@@ -128,6 +128,8 @@ JSON; the *proposed* fix, before application. `replace_import` (notebook code ed
 
 `action` ∈ `install | pin_version | none`. `version` is `null` for a plain install. `command` is what the FixApplicator runs inside the container.
 
+`command` is always constructed by deterministic code from the validated `install_name`/`version`, after those fields have been checked against retrieved PyPI/compatibility evidence - it is never taken from LLM output, even though the LLM proposes `action`/`install_name`/`version` themselves. See `docs/rag-design.md` §2.2 and `docs/prompts.md` §8 ("Command construction") for the full contract.
+
 ### 6.2 `repair_attempts` table — SQLite
 
 The validation log *and* the benchmark dataset (O4). One row per attempt (a two-round repair = two rows; different models/prompts = more rows), linked to the existing `notebook_executions`.

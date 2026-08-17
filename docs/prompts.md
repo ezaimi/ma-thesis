@@ -406,18 +406,46 @@ PyPI-safe versions and versions an official source (`config/api_compatibility_ev
 confirms still contain the missing symbol. If that intersection is empty, or no registry entry
 exists for the pattern, `pypi_versions` is `Not available` and the only valid action is `none` -
 the prompt must never be given raw PyPI metadata as if it were sufficient evidence for a
-`wrong_version` pin. See `docs/rag-design.md` §2.2 for the full ten-step contract.
+`wrong_version` pin. See `docs/rag-design.md` §2.2 for the full contract.
 
 ### Repair rules
 
 - Allowed actions are only `install`, `pin_version`, and `none`.
 - Use `install` only for a missing, pip-installable dependency.
-- Use `pin_version` only when the available PyPI data supports a specific compatible version.
-- A `pin_version` result must include a non-null `version` and a matching exact install command.
-- Use `none` when no safe pip-only fix can be proposed, when the issue requires a source-code or environment-path change, or when version evidence is insufficient.
+- Use `pin_version` only when the supplied candidate versions (`pypi_versions`) include a specific compatible version.
+- A `pin_version` proposal must select `version` from those supplied candidate versions - never a version outside that set.
+- Use `none` when no safe pip-only fix can be proposed, when the issue requires a source-code or environment-path change, or when the supplied evidence is insufficient.
 - Do not suggest `apt`, `conda`, `pip uninstall`, notebook code edits, import replacement, or environment-variable changes.
 - The import name and pip install name may differ. Both fields must be returned.
 - Do not assume that an import name is also a pip package name. If no verified mapping is available, use `none`.
+- **The LLM does not return a `command` field.** Deterministic code constructs `command` only after validating this response against the retrieved evidence - see "Command construction" below.
+
+### Command construction (i4 correction)
+
+Earlier drafts of this prompt had the model return `command` directly as part of its JSON output.
+That design is superseded: it let free-text model output reach a field that is later run inside a
+container. The corrected contract:
+
+- The LLM's own response schema has no `command` field.
+- The LLM proposes `action`, `install_name`, `version` (for `pin_version`, drawn only from the
+  candidate versions supplied in `pypi_versions`), and `rationale`.
+- Deterministic code then validates the proposal against retrieved evidence: `action` is one of the
+  three allowed values; `install_name` matches the distribution `RAGRepairAgent` itself already
+  resolved (not one the model invented); a proposed `version` is literally present in the supplied
+  candidate set; for `wrong_version`, a resolved compatibility-evidence entry exists.
+- Only after validation passes does deterministic code construct `command` - an f-string built from
+  the validated `install_name`/`version`, e.g. `pip install {install_name}` or
+  `pip install {install_name}=={version}`.
+- Any proposal that fails validation - an invented name, a version outside the supplied candidates,
+  an ungrounded `pin_version` - is discarded and logged as `action: "none"`, never as the model's
+  original text.
+- `command` still appears in the final logged fix object (§6.1); it is simply never written by the
+  LLM. FixApplicator (a later, out-of-scope component) is responsible for executing that
+  deterministically-built command as an argv list, without shell interpolation, and for confirming
+  whether it actually resolves the original error - this document does not claim that has happened.
+
+See `docs/rag-design.md` §2.2 for the full retrieval -> proposal -> validation -> command-construction
+sequence, and the "implemented vs. planned" note there for what actually exists in code today.
 
 ### Zero-shot prompt template
 
@@ -436,16 +464,16 @@ Rules:
 - Use only the supplied information.
 - Do not invent package names, package versions, Python-version compatibility, or PyPI evidence.
 - For "install", set "version" to null.
-- For "install", "install_name" and "command" must be non-null. The command must be exactly `pip install <install_name>`.
-- For "pin_version", "install_name", "version", and "command" must be non-null. The command must be exactly `pip install <install_name>==<version>`.
-- For "pin_version", "version" must be a non-null version supported by the provided PyPI data.
+- For "install", "install_name" must be non-null.
+- For "pin_version", "install_name" and "version" must be non-null, and "version" must be one of the candidate versions listed in the supplied PyPI data.
 - If a safe version cannot be supported by the supplied PyPI data, use "none".
-- For "none", set "install_name", "version", and "command" to null.
+- For "none", set "install_name" and "version" to null.
 - Do not propose apt, conda, pip uninstall, source-code edits, import replacements, or path changes.
 - The import name and pip install name may differ. Return both names.
 - Known examples include: sklearn → scikit-learn; umap → umap-learn; pkg_resources → setuptools.
 - Do not assume that an import name is also a pip package name. For an unknown import name, use "none" unless a verified import-to-package mapping is provided in the input or listed in the known examples.
 - When using "none" because the pip package name is unknown, state in the rationale that the pip package name cannot be safely determined from the available information.
+- Do not return a "command" field. It is not part of your response.
 
 Return exactly this JSON structure:
 {
@@ -453,7 +481,6 @@ Return exactly this JSON structure:
   "import_name": "string",
   "install_name": "string or null",
   "version": "string or null",
-  "command": "string or null",
   "rationale": "one short sentence",
   "pypi_evidence": {
     "latest_version": "string or null",
@@ -491,7 +518,6 @@ For a missing `sklearn` import:
   "import_name": "sklearn",
   "install_name": "scikit-learn",
   "version": null,
-  "command": "pip install scikit-learn",
   "rationale": "The sklearn import is missing and is provided by the scikit-learn package.",
   "pypi_evidence": {
     "latest_version": null,
@@ -500,6 +526,10 @@ For a missing `sklearn` import:
   }
 }
 ```
+
+Deterministic code then validates `install_name` against the distribution `RAGRepairAgent` resolved,
+constructs `command: "pip install scikit-learn"`, and adds it to the logged fix object. The model's
+own response above never contains a `command` field.
 
 ### Version-mismatch handling before L5
 
@@ -513,7 +543,6 @@ For a likely version mismatch without grounded PyPI data, a safe output is:
   "import_name": "scipy",
   "install_name": null,
   "version": null,
-  "command": null,
   "rationale": "A specific compatible scipy version cannot be selected safely without PyPI version evidence.",
   "pypi_evidence": {
     "latest_version": null,
@@ -522,6 +551,9 @@ For a likely version mismatch without grounded PyPI data, a safe output is:
   }
 }
 ```
+
+For `action: "none"`, the final logged fix object still has `command: null` - set deterministically,
+not returned by the model.
 
 ### Design rationale
 
@@ -560,11 +592,18 @@ After receiving the model response, the pipeline must:
    - `none`
 
 4. verify action-dependent rules:
-   - `install` requires an `install_name` and command, while `version` is `null`;
-   - `pin_version` requires an `install_name`, a non-null `version`, and a matching command;
-   - `none` must not propose a command;
+   - `install` requires a non-null `install_name`, matching the distribution `RAGRepairAgent`
+     already resolved for this record, while `version` is `null`;
+   - `pin_version` requires a non-null `install_name` and a `version` that is literally present in
+     the candidate versions supplied to the model in `pypi_versions`;
+   - `none` must not propose an `install_name` or `version`;
 
-5. reject outputs containing unsupported actions or non-pip commands.
+5. reject any proposal containing an unsupported action, an `install_name` the model invented
+   rather than one already resolved, or a `version` outside the supplied candidate set;
+
+6. only after validation passes does deterministic code construct `command` from the validated
+   `install_name`/`version` and attach it to the logged fix object - the model's response itself
+   never contains a `command` field to check.
 
 ### Malformed-output retry
 
@@ -621,7 +660,6 @@ Output:
   "import_name": "sklearn",
   "install_name": "scikit-learn",
   "version": null,
-  "command": "pip install scikit-learn",
   "rationale": "The sklearn import is missing and is provided by the scikit-learn package.",
   "pypi_evidence": {
     "latest_version": null,
@@ -640,7 +678,6 @@ Output:
   "import_name": "umap",
   "install_name": "umap-learn",
   "version": null,
-  "command": "pip install umap-learn",
   "rationale": "The umap import is missing and is provided by the umap-learn package.",
   "pypi_evidence": {
     "latest_version": null,

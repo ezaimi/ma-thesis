@@ -91,31 +91,57 @@ different notebook corpus would surface different `cannot import name` patterns,
 its own hand-verified entry. This registry does not generalize automatically to unseen patterns,
 and should not be presented as though it did.
 
-**RAGRepairAgent integration contract.** When `refined_subtype == "wrong_version"`, the component
-(once built) must follow this sequence, and must not skip or reorder the intersection step:
+**RAGRepairAgent role contract (controlled RAG).** This supersedes earlier drafts of this section,
+which described the LLM as drafting "only the `rationale` field" in one paragraph and then, a few
+lines later, having it "propose `pin_version`" with "a selected version" - two different roles
+stated as if they were the same one. The corrected, single design has four responsibilities, each
+owned by exactly one layer:
 
-1. Parse the module path and missing symbol from the `cannot import name '<symbol>' from
-   '<module_path>'` error message.
-2. Resolve the PyPI distribution name (`pypi_retriever.resolve_distribution_name`).
-3. Retrieve PyPI candidate versions and filter them for Python 3.10 compatibility (the fixed
-   execution-environment constant - see the i4 design review's Q1 finding, not a per-row lookup).
-4. Call `lookup_compatibility_evidence(distribution_name, module_path, symbol)`.
-5. Intersect the two version sets with `filter_versions_by_compatibility_evidence()`: only
-   versions present in **both** the PyPI-safe set and the API-compatible set may be proposed.
-6. If an optional LLM step is used at all (see the i4 design review's Q3 recommendation), it may
-   see only the intersected versions and the evidence summary - never the full unfiltered PyPI
-   candidate list - and may draft only the `rationale` field.
-7. The LLM, if consulted, may propose `pin_version` only from the intersection computed in step 5.
-8. Deterministic code validates that the LLM's selected version (if any) is actually a member of
-   the intersection before accepting it.
-9. The `command` string is always constructed deterministically from the validated
-   `install_name`/`version` - never taken from LLM output (see the i4 design review's Q2 finding).
-10. If the intersection from step 5 is empty, or `lookup_compatibility_evidence` returned anything
-    other than `resolved`, the result is `action: "none"` - no version is ever guessed.
+1. **Deterministic retriever** - resolves the PyPI distribution name
+   (`pypi_retriever.resolve_distribution_name`); retrieves PyPI candidate versions and filters them
+   for Python-version compatibility (per the `runtime.python_version` value in
+   `config/rag_repair.yaml` - a fixed constant, not a per-row lookup; see §4 below), yanked status,
+   and pre-release status; and, for `wrong_version`, calls `lookup_compatibility_evidence()` and
+   intersects the result with the PyPI-safe candidates via
+   `filter_versions_by_compatibility_evidence()`. The output of this layer is a **grounded
+   candidate set** - never the raw, unfiltered PyPI response.
+2. **LLM** - receives only the grounded candidate set and its evidence summary, never raw PyPI
+   data. It chooses and proposes a structured `action` (`install` / `pin_version` / `none`), an
+   `install_name`, and - for `pin_version` - a `version` selected **from the supplied grounded set
+   only**, plus a `rationale`. This is a real, load-bearing contribution: the LLM is the component
+   that decides which action fits the evidence, not a component limited to writing prose about a
+   decision already made elsewhere. It is not, however, permitted to invent a distribution name,
+   a version outside the supplied set, or a `command`.
+3. **Deterministic validator** - checks the LLM's proposal against the retrieval evidence before
+   trusting any of it: `action` is one of the three allowed values; `install_name` matches the
+   distribution the retriever already resolved (not one the model introduced); a proposed `version`
+   is literally present in the grounded candidate set; for `wrong_version`, a `resolved` (not
+   `no_evidence`/`invalid_entry`) compatibility-evidence entry exists. Any proposal that fails any
+   of these checks is discarded and overridden to `action: "none"` - the LLM's original text is
+   never passed through unvalidated.
+4. **Deterministic command builder** - only after validation passes, constructs `command` as an
+   f-string built from the validated `install_name`/`version` (e.g. `pip install {install_name}`
+   or `pip install {install_name}=={version}`). The LLM never sees or fills this field - see
+   `docs/prompts.md` §8 "Command construction" for the corresponding prompt-side contract.
+
+For `wrong_version` specifically, the grounded candidate set from step 1 comes from the
+intersection described earlier in this section; if that intersection is empty, or
+`lookup_compatibility_evidence` returned anything other than `resolved`, the retriever passes an
+empty candidate set forward, and the LLM has nothing to select from - the result is `action:
+"none"`. No version is ever guessed by any layer.
 
 This module only proposes. It does not run `pip`, does not modify a notebook's environment, and
 does not confirm that a proposed pin actually resolves the original error - that confirmation is
-FixApplicator's job (a later step), via re-execution.
+FixApplicator's job (a later step, out of scope here), via re-execution.
+
+**Implemented now vs. planned.** As of this writing: import-name resolution and normalization
+(`pypi_retriever.resolve_distribution_name`/`normalize_distribution_name`) and the API-compatibility
+evidence lookup and intersection (`scripts/compatibility_evidence.py`, all of step 1's `wrong_version`
+half) are implemented and tested. Everything else in this contract - the PyPI HTTP retrieval and
+yanked/pre-release/Python-version filtering (the rest of step 1), the LLM call itself, the
+validator, the command builder, and `scripts/rag_repair_agent.py` as an entry point - is design
+only; none of it exists in code yet. This section describes the target the next implementation
+step should build toward, not a description of running code.
 
 
 
@@ -162,7 +188,7 @@ The retriever receives structured context from the failed notebook execution and
 | `distribution_name` | no | Verified PyPI distribution name after name resolution, for example `scikit-learn`. |
 | `error_type` | yes | Dependency-related Python error type, such as `ModuleNotFoundError` or `ImportError`. |
 | `traceback` | yes | Error message or traceback used to identify the dependency problem. |
-| `python_version` | no | Python runtime version of the failed notebook environment, used to filter incompatible releases. |
+| `python_version` | yes | Python runtime version used to filter incompatible releases. Fixed at `"3.10"` for every notebook - see below. |
 | `installed_version` | no | Known installed version of the affected distribution, if available. |
 | `current_requirements` | no | Existing dependency declarations from the repository or notebook environment. |
 | `prior_attempt` | no | Previous repair result, used only in a later repair round. |
@@ -171,7 +197,16 @@ The minimum retrieval input is `import_name`, `error_type`, and `traceback`.
 
 If `distribution_name` cannot be resolved through the verified mapping policy, the retriever returns `mapping_unknown` and does not query PyPI.
 
-If `python_version` is unavailable, the retriever may return package metadata but must not claim that a candidate release is compatible with the notebook runtime.
+**`python_version` is a fixed constant, not a per-notebook value.** The upstream Docker pipeline
+builds one Dockerfile template for every repository it processes, with the base image hardcoded to
+`python:3.10-slim` (`lib/docker.sh`'s `create_dockerfile()`, in
+`Sheeba-Samuel/computational-reproducibility-pmc-docker`) - every notebook this repair layer sees
+therefore ran under the same interpreter. The authoritative value is
+`runtime.python_version: "3.10"` in `config/rag_repair.yaml`; any future `retrieve()` implementation
+must read it from there rather than deriving it per row. Do not use the Docker pipeline's
+`notebooks.language_version` column as a substitute - it records each notebook's own, frequently
+stale or `"unknown"`, author-time kernelspec metadata, not the version the container actually
+executes with, and using it would silently substitute the wrong runtime for most notebooks.
 
 
 
