@@ -56,6 +56,67 @@ was never attempted because the record is out of the pip-only scope" from "repai
 and returned `none`" - the exact field name and value are left to the i4/O4 implementation, since
 the `repair_attempts` table (§6.2 of `docs/architecture-note.md`) does not yet define one.
 
+### 2.2 Grounded API-compatibility evidence for `wrong_version` (i4)
+
+§2 already states the core limitation: PyPI metadata alone cannot prove that a specific import
+symbol exists in a specific release. Confirmed directly against the official PyPI Simple
+Repository API specification while implementing this section: per-file metadata is limited to
+`filename`, `url`, `hashes`, `requires-python`, `size`, `upload-time`, `yanked`, `core-metadata`,
+`gpg-sig`, and `provenance` - nothing enumerates exported functions, classes, or symbols.
+Determining "does `scipy.integrate.cumtrapz` exist in release X" requires either downloading and
+inspecting the distribution itself, or consulting the package's own official documentation of
+that fact. Neither is something the PyPI Simple API can answer.
+
+**The compatibility registry.** `config/api_compatibility_evidence.yaml` is a small, hand-curated
+registry that closes this gap for a fixed set of known `wrong_version` patterns. It is
+deliberately **not** a generic changelog crawler or an automated release-note scraper - every
+entry is added by a person, verified against one official source (release notes, migration guide,
+or the package's own source repository), and dated. See the schema comment at the top of that
+file for the exact field contract, and `scripts/compatibility_evidence.py` for the loader and
+lookup functions (`load_compatibility_evidence`, `lookup_compatibility_evidence`,
+`filter_versions_by_compatibility_evidence`).
+
+**Currently supported patterns.** Three, covering all three unique `wrong_version` failure
+signatures present in the 21-row dataset (verified 2026-08-17):
+
+| Pattern | Compatible | Official source |
+|---|---|---|
+| `scipy.integrate.cumtrapz` | `<1.14.0` | SciPy 1.14.0 release notes, "Expired deprecations" |
+| `scipy.sparse.sputils.isshape` | `<1.14.0` | SciPy 1.14.0 release notes + source-repository verification |
+| `numpy.VisibleDeprecationWarning` | `<2.0.0` | NumPy 2.0.0 release notes, "NumPy 2.0 Python API removals" |
+
+Any `wrong_version` pattern not in this table returns `no_evidence` and must not receive a
+proposed pin - see the integration contract below. Coverage is necessarily dataset-specific: a
+different notebook corpus would surface different `cannot import name` patterns, each requiring
+its own hand-verified entry. This registry does not generalize automatically to unseen patterns,
+and should not be presented as though it did.
+
+**RAGRepairAgent integration contract.** When `refined_subtype == "wrong_version"`, the component
+(once built) must follow this sequence, and must not skip or reorder the intersection step:
+
+1. Parse the module path and missing symbol from the `cannot import name '<symbol>' from
+   '<module_path>'` error message.
+2. Resolve the PyPI distribution name (`pypi_retriever.resolve_distribution_name`).
+3. Retrieve PyPI candidate versions and filter them for Python 3.10 compatibility (the fixed
+   execution-environment constant - see the i4 design review's Q1 finding, not a per-row lookup).
+4. Call `lookup_compatibility_evidence(distribution_name, module_path, symbol)`.
+5. Intersect the two version sets with `filter_versions_by_compatibility_evidence()`: only
+   versions present in **both** the PyPI-safe set and the API-compatible set may be proposed.
+6. If an optional LLM step is used at all (see the i4 design review's Q3 recommendation), it may
+   see only the intersected versions and the evidence summary - never the full unfiltered PyPI
+   candidate list - and may draft only the `rationale` field.
+7. The LLM, if consulted, may propose `pin_version` only from the intersection computed in step 5.
+8. Deterministic code validates that the LLM's selected version (if any) is actually a member of
+   the intersection before accepting it.
+9. The `command` string is always constructed deterministically from the validated
+   `install_name`/`version` - never taken from LLM output (see the i4 design review's Q2 finding).
+10. If the intersection from step 5 is empty, or `lookup_compatibility_evidence` returned anything
+    other than `resolved`, the result is `action: "none"` - no version is ever guessed.
+
+This module only proposes. It does not run `pip`, does not modify a notebook's environment, and
+does not confirm that a proposed pin actually resolves the original error - that confirmation is
+FixApplicator's job (a later step), via re-execution.
+
 
 
 ## 3. Import Name Resolution Policy

@@ -1,0 +1,89 @@
+# Curated API-compatibility evidence for wrong_version repair proposals.
+#
+# PyPI release metadata (version numbers, requires-python, yanked status) can
+# never prove that a specific import symbol exists in a specific release --
+# see docs/rag-design.md §2.2. This file closes that gap with a small,
+# hand-verified registry: each entry records the last PyPI release range in
+# which a symbol that a notebook tried to import is known, from an official
+# source, to still exist.
+#
+# This is deliberately NOT a generic changelog crawler. Every entry below was
+# looked up by hand against an official release-notes page (or the package's
+# own source repository, where release notes only made a general statement)
+# on the date in `verified_at`. Do not add an entry without a real,
+# verifiable official source. Unsupported patterns are simply absent from
+# this file -- they must not receive a fabricated entry.
+#
+# Schema
+# ------
+# patterns:
+#   <module_path>.<symbol>:            # exact match key, case-sensitive
+#     distribution_name: <str>          # PyPI distribution name (compared
+#                                        # after PEP 503 normalization only)
+#     module_path: <str>                # exact, case-sensitive
+#     symbol: <str>                     # exact, case-sensitive
+#     compatible_specifier: <str>       # PEP 440 specifier, parsed with
+#                                        # packaging.specifiers.SpecifierSet
+#     incompatible_from: <str|null>     # first version the symbol is known
+#                                        # to be gone, for human reference;
+#                                        # not itself parsed/enforced
+#     evidence:
+#       source_type: <str>              # e.g. official_release_notes,
+#                                        # official_source_repository
+#       source_url: <str>               # must be https://, an official
+#                                        # project domain, not a blog/forum
+#       summary: <str>                  # short paraphrase, not a long quote
+#       verified_at: <YYYY-MM-DD>       # date this entry was checked
+
+patterns:
+  scipy.integrate.cumtrapz:
+    distribution_name: scipy
+    module_path: scipy.integrate
+    symbol: cumtrapz
+    compatible_specifier: "<1.14.0"
+    incompatible_from: "1.14.0"
+    evidence:
+      source_type: official_release_notes
+      source_url: "https://docs.scipy.org/doc/scipy/release/1.14.0-notes.html"
+      summary: >-
+        SciPy 1.14.0 release notes, "Expired deprecations": scipy.integrate.{simps,
+        trapz,cumtrapz} were removed in favour of simpson, trapezoid, and
+        cumulative_trapezoid.
+      verified_at: "2026-08-17"
+
+  scipy.sparse.sputils.isshape:
+    distribution_name: scipy
+    module_path: scipy.sparse.sputils
+    symbol: isshape
+    compatible_specifier: "<1.14.0"
+    incompatible_from: "1.14.0"
+    evidence:
+      source_type: official_release_notes
+      source_url: "https://docs.scipy.org/doc/scipy/release/1.14.0-notes.html"
+      summary: >-
+        SciPy 1.14.0 release notes, "Expired deprecations": objects only
+        accessible through deprecated private submodules were removed.
+        scipy.sparse.sputils became a deprecated re-export shim in 1.8.0;
+        verified directly against scipy's source repository that the shim's
+        __all__ still listed isshape at tag v1.13.1 and was emptied at v1.14.0,
+        so the deprecated `from scipy.sparse.sputils import isshape` path
+        stops working starting at 1.14.0.
+      verified_at: "2026-08-17"
+
+  numpy.VisibleDeprecationWarning:
+    distribution_name: numpy
+    module_path: numpy
+    symbol: VisibleDeprecationWarning
+    compatible_specifier: "<2.0.0"
+    incompatible_from: "2.0.0"
+    evidence:
+      source_type: official_release_notes
+      source_url: "https://numpy.org/doc/stable/release/2.0.0-notes.html"
+      summary: >-
+        NumPy 2.0.0 release notes, "NumPy 2.0 Python API removals": warnings
+        and exceptions present in numpy.exceptions (e.g. VisibleDeprecationWarning)
+        are no longer exposed in the main namespace. numpy.exceptions itself
+        was added in NumPy 1.25, so 1.25-1.26.x expose the symbol in both
+        locations; only numpy.exceptions.VisibleDeprecationWarning remains
+        from 2.0.0 onward.
+      verified_at: "2026-08-17"

@@ -399,6 +399,15 @@ The prompt receives:
 
 If a context field is unavailable, the value `Not available` is passed.
 
+**wrong_version clarification (i4):** for a `wrong_version` record, `pypi_versions` must never be
+the raw, unfiltered PyPI candidate list. It must be the output of
+`compatibility_evidence.filter_versions_by_compatibility_evidence()` - the intersection of
+PyPI-safe versions and versions an official source (`config/api_compatibility_evidence.yaml`)
+confirms still contain the missing symbol. If that intersection is empty, or no registry entry
+exists for the pattern, `pypi_versions` is `Not available` and the only valid action is `none` -
+the prompt must never be given raw PyPI metadata as if it were sufficient evidence for a
+`wrong_version` pin. See `docs/rag-design.md` §2.2 for the full ten-step contract.
+
 ### Repair rules
 
 - Allowed actions are only `install`, `pin_version`, and `none`.
