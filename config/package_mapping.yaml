@@ -1,0 +1,9 @@
+sklearn: scikit-learn
+umap: umap-learn
+pkg_resources: setuptools
+scipy: scipy
+numpy: numpy
+pandas: pandas
+Bio: biopython
+cv2: opencv-python
+skimage: scikit-image

@@ -1,0 +1,89 @@
+# Runtime configuration for RAGRepairAgent (i4).
+#
+# python_version is NOT looked up per notebook. The upstream Docker pipeline
+# (Sheeba-Samuel/computational-reproducibility-pmc-docker) builds one
+# Dockerfile template for every repository it processes, with the base image
+# hardcoded: `FROM python:3.10-slim` in lib/docker.sh's create_dockerfile(),
+# confirmed again by the hardcoded `python3.10` PYTHONPATH entry in
+# lib/entrypoint.sh. There is no per-repository or per-notebook variation, so
+# every notebook this repair layer processes ran under the same interpreter.
+#
+# Do NOT use the Docker pipeline's `notebooks.language_version` database
+# column as a substitute: that field records each notebook's own, often
+# stale or "unknown", author-time kernelspec metadata - not the version the
+# Docker container actually executes with. Using it would silently
+# substitute the wrong runtime for most notebooks.
+#
+# Any future PyPI retrieval/filtering code (scripts/pypi_retriever.py's
+# retrieve(), once implemented) must read python_version from this file
+# rather than hardcoding it inline or deriving it per row. See
+# docs/rag-design.md §2.2 and §4 for the full contract this value feeds.
+
+runtime:
+  python_version: "3.10"
+
+# PyPI HTTP client rate limiting (i4, issue #42 checklist item 10). Caching
+# (scripts/pypi_retriever.py's in-memory _pypi_response_cache) already
+# avoids repeat requests for the same distribution within one run; this
+# section adds the missing half - spacing between distinct real requests.
+# Single-process, in-memory only - not persistent across runs, not
+# distributed across parallel workers. See docs/rag-design.md §2.4.
+pypi_client:
+  rate_limit:
+    # Minimum spacing, in seconds, enforced before each real (uncached)
+    # PyPI request. A cache hit never waits and is never counted. 0.5s is a
+    # conservative default, well under PyPI's documented anonymous rate
+    # limits. Set to 0 to disable throttling (e.g. in tests).
+    min_request_interval_seconds: 0.5
+
+    # HTTP 429 handling: at most this many bounded retries for one logical
+    # fetch_pypi_project() call, honored only when the server's Retry-After
+    # header is present and parses as a plain number of seconds (the
+    # HTTP-date form is not supported and is treated the same as "no
+    # Retry-After given" - never guessed, never crashed on).
+    max_retries_on_429: 1
+
+    # A Retry-After value larger than this is never waited on - the request
+    # fails as "network_error" instead of blocking a batch run for an
+    # unbounded amount of time.
+    max_retry_after_seconds: 5.0
+
+# RAGRepairAgent (i4) settings. Mirrors config/llm_explainer.yaml's shape
+# and reuses the same model (Gemma-2 9B via Ollama) - the L4 decision
+# (docs/prompts.md §5) was to share one model between LLMExplainer and
+# RAGRepairAgent so a later baseline evaluation isn't confounded by mixing
+# model effects between the two components.
+repair_agent:
+  ollama:
+    url: "http://localhost:11434/api/generate"
+    model: "gemma2:9b"
+    temperature: 0.1
+    top_p: 0.9
+    max_tokens: 700
+    # 300s is the maximum observed during the CPU-only live pilot
+    # (2026-08-17): the committed 120s timed out twice for the same record
+    # (ID 8) that then succeeded once raised to 300s on the same
+    # CPU-only machine, gemma2:9b at 100% CPU. This is not the expected
+    # response time - it's a conservative ceiling for slow, CPU-only
+    # hardware; faster/GPU hardware should respond well under it. A
+    # timeout never executes an argv (nothing has been validated yet at
+    # that point) and still only costs one bounded retry - see
+    # docs/i4-live-validation.md.
+    timeout_seconds: 300
+
+  prompt:
+    template: "dependency_repair_v1"
+    version: "i4_prompt_v1"
+
+  retry:
+    max_retries: 1
+    retry_on:
+      - invalid_json
+      - schema_validation_error
+      - grounding_validation_error
+      - timeout
+      - model_unavailable
+
+  output:
+    path: "data/repair-proposals/repair_proposals.jsonl"
+    schema: "schemas/repair_proposal.schema.json"

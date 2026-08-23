@@ -1,0 +1,130 @@
+You are proposing a safe, structured pip-based repair for a dependency-related Jupyter notebook execution failure.
+
+Your task:
+- Propose exactly one repair action, using only the retrieval evidence supplied below.
+- Use only the information provided in this input record.
+- Never invent a distribution name. install_name must be exactly one of the values shown in this record, or null.
+- Never invent a version. version must be exactly one of the candidate versions shown in this record, or null.
+- Never return a shell command or pip command. Do not include a "command" field.
+- A PyPI candidate version is not proof that the notebook will actually succeed - only the later notebook rerun (outside this component) determines that.
+- If the supplied evidence is insufficient to safely propose install or pin_version, return action "none".
+- Return only valid JSON.
+- Do not wrap the JSON in markdown.
+
+Output rules:
+- Return exactly these fields: action, install_name, version, rationale
+- "action" must be one of: install, pin_version, none
+- For "install": install_name must be the exact resolved distribution name shown below; version must be null.
+- For "pin_version": install_name must be the exact resolved distribution name shown below; version must be exactly one of the candidate versions shown below.
+- For "none": install_name must be null and version must be null.
+- "rationale" must be a short sentence grounded only in the evidence shown below.
+- Do not return any field other than action, install_name, version, rationale.
+
+Subtype-specific rules:
+- subtype "missing_package": the only valid non-abstaining action is "install".
+- subtype "wrong_version": the only valid non-abstaining action is "pin_version", and version must come from the candidate versions below - never a version you infer from general knowledge of the package's history.
+
+Example 1 - missing_package, grounded install:
+Input:
+notebook_execution_id: 8
+error_type: ModuleNotFoundError
+error_message: No module named 'sklearn'
+subtype: missing_package
+root_cause_hint: import_distribution_name_mismatch
+failing_module: sklearn
+resolved distribution_name: scikit-learn
+python_version: 3.10
+candidate_versions:
+- 1.7.2 (python_compatibility: compatible)
+- 1.7.1 (python_compatibility: compatible)
+compatibility constraint: Not available
+compatibility evidence: Not available
+retrieval warnings: none
+
+Output:
+{
+  "action": "install",
+  "install_name": "scikit-learn",
+  "version": null,
+  "rationale": "sklearn is missing; the retriever resolved it to the scikit-learn distribution, which PyPI confirms exists with a Python-3.10-compatible release."
+}
+
+Example 2 - wrong_version, grounded pin_version:
+Input:
+notebook_execution_id: 174
+error_type: ImportError
+error_message: cannot import name 'cumtrapz' from 'scipy.integrate'
+subtype: wrong_version
+root_cause_hint: version_or_api_incompatibility
+failing_module: scipy
+resolved distribution_name: scipy
+python_version: 3.10
+candidate_versions:
+- 1.13.1 (python_compatibility: compatible)
+- 1.13.0 (python_compatibility: compatible)
+compatibility constraint: <1.14.0
+compatibility evidence: SciPy 1.14.0 release notes, "Expired deprecations": scipy.integrate.cumtrapz was removed in favour of cumulative_trapezoid.
+retrieval warnings: none
+
+Output:
+{
+  "action": "pin_version",
+  "install_name": "scipy",
+  "version": "1.13.1",
+  "rationale": "cumtrapz was removed in SciPy 1.14.0; 1.13.1 is the newest candidate version below that boundary, confirmed Python-3.10-compatible."
+}
+
+Example 3 - abstention, evidence insufficient:
+Input:
+notebook_execution_id: 999
+error_type: ModuleNotFoundError
+error_message: No module named 'dms_variants'
+subtype: missing_package
+root_cause_hint: insufficient_context
+failing_module: dms_variants
+resolved distribution_name: Not available
+python_version: 3.10
+candidate_versions: Not available
+compatibility constraint: Not available
+compatibility evidence: Not available
+retrieval warnings: none
+
+Output:
+{
+  "action": "none",
+  "install_name": null,
+  "version": null,
+  "rationale": "No verified PyPI distribution mapping exists for dms_variants, so no safe install command can be grounded."
+}
+
+Now propose a repair for this input record.
+
+Input record:
+notebook_execution_id: {{notebook_execution_id}}
+error_type: {{error_type}}
+error_message: {{error_message}}
+subtype: {{subtype}}
+root_cause_hint: {{root_cause_hint}}
+failing_module: {{failing_module}}
+
+failing_cell_source:
+{{failing_cell_source}}
+
+import_cells:
+{{import_cells}}
+
+surrounding_cells:
+{{surrounding_cells}}
+
+resolved distribution_name: {{distribution_name}}
+python_version: {{python_version}}
+candidate_versions:
+{{candidate_versions}}
+
+compatibility constraint: {{compatibility_constraint}}
+compatibility evidence: {{compatibility_evidence_summary}}
+
+retrieval warnings: {{retrieval_warnings}}
+retrieval limitations: {{retrieval_limitations}}
+
+Return only JSON:
