@@ -115,6 +115,40 @@ produced `module_path: "scipy.integrate"`, `symbol: "cumtrapz"`. Compatibility e
 - This was a 3-record pilot, not the eventual 187-row evaluation split - response reliability, retry
   frequency, and timing at that scale remain unmeasured.
 
+## cv2 / skimage mapping fix validation
+
+Local record of a follow-up check performed after a pre-push review found that `cv2` and `skimage`,
+both present as `usable`, `missing_package` rows in the current dependency-error dataset, had no
+entry in `config/package_mapping.yaml`, so `pypi_retriever.retrieve()` returned `mapping_unknown` for
+them instead of resolving a distribution. `cv2: opencv-python` and `skimage: scikit-image` were added
+to `config/package_mapping.yaml`, and the fix was re-checked against the real `retrieve()` production
+entry point and the real PyPI Simple API, the same way the five-name PoC above was checked.
+
+- Date: 2026-08-23.
+
+| Import | Distribution | Status | Candidate versions |
+|---|---|---|---|
+| `cv2` | `opencv-python` | `resolved` | `5.0.0.93`, `4.14.0.94`, `4.13.0.92`, `4.13.0.90`, `4.12.0.88` |
+| `skimage` | `scikit-image` | `resolved` | `0.25.2`, `0.25.1`, `0.25.0`, `0.24.0`, `0.23.2` |
+| `sklearn` (regression check) | `scikit-learn` | `resolved` | `1.7.2`, `1.7.1`, `1.7.0`, `1.6.1`, `1.6.0` |
+
+Confirmed during this check:
+
+- The real dataset row for `cv2` (`notebook_execution_id: 79`, `scope_status: usable`,
+  `refined_subtype: missing_package`) now resolves `distribution_name: "opencv-python"` via
+  `resolve_distribution_name()` instead of stopping at `mapping_unknown` - the failure mode a
+  pre-push review had flagged.
+- `sklearn -> scikit-learn` (an existing, previously-verified mapping) still resolves correctly,
+  confirming the new entries did not disturb existing mapping behavior.
+- As with `scikit-learn` in the original five-name PoC, legacy `.exe`-based release artifacts on
+  `scikit-learn`'s and `opencv-python`'s real PyPI histories produced non-fatal warnings
+  (unparseable filenames) rather than being miscounted as valid releases.
+- The exact candidate version numbers reflect what PyPI reported on 2026-08-23 and will drift as
+  these projects publish new releases - read them as a point-in-time confirmation, not a constant.
+
+No Ollama call, no installation, and no notebook execution occurred during this check - it exercises
+only `pypi_retriever.py`, exactly as the five-name PoC above did.
+
 ## Issue #42 traceability (local record only - GitLab itself was not modified)
 
 Live evidence gathered above locally supports the following checklist items; this is a note for

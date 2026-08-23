@@ -57,6 +57,14 @@ def test_resolve_unknown_import_returns_none():
     assert resolve_distribution_name("dms_variants") is None
 
 
+def test_resolve_cv2_returns_opencv_python():
+    assert resolve_distribution_name("cv2") == "opencv-python"
+
+
+def test_resolve_skimage_returns_scikit_image():
+    assert resolve_distribution_name("skimage") == "scikit-image"
+
+
 def test_resolve_does_not_assume_identity_mapping():
     assert resolve_distribution_name("not_a_real_import_xyz") is None
 
@@ -83,6 +91,8 @@ def test_package_mapping_loads_expected_entries():
     assert mapping["scipy"] == "scipy"
     assert mapping["numpy"] == "numpy"
     assert mapping["pandas"] == "pandas"
+    assert mapping["cv2"] == "opencv-python"
+    assert mapping["skimage"] == "scikit-image"
 
 
 # --- repair-runtime configuration (config/rag_repair.yaml) ------------------
@@ -1118,6 +1128,54 @@ def test_retrieve_pkg_resources_resolves_to_setuptools_and_applies_filtering(mon
         "latest_version", "candidate_versions", "compatibility_evidence",
         "source_endpoint", "retrieved_at", "warnings", "error",
     }
+
+
+def test_retrieve_cv2_resolves_to_opencv_python_and_does_not_return_mapping_unknown(monkeypatch):
+    captured = {}
+    payload = {
+        "files": [
+            {"filename": "opencv_python-4.10.0.84-py3-none-any.whl", "yanked": False, "requires-python": ">=3.10"},
+        ]
+    }
+
+    def fake_urlopen(request, timeout=None):
+        captured["url"] = request.full_url
+        return FakeResponse(json.dumps(payload).encode("utf-8"))
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    result = retrieve("cv2", python_version="3.10")
+
+    assert result["distribution_name"] == "opencv-python"
+    assert captured["url"] == "https://pypi.org/simple/opencv-python/"
+    assert result["status"] == "resolved"
+    assert result["status"] != "mapping_unknown"
+    versions = [c["version"] for c in result["candidate_versions"]]
+    assert versions == ["4.10.0.84"]
+
+
+def test_retrieve_skimage_resolves_to_scikit_image_and_does_not_return_mapping_unknown(monkeypatch):
+    captured = {}
+    payload = {
+        "files": [
+            {"filename": "scikit_image-0.24.0-py3-none-any.whl", "yanked": False, "requires-python": ">=3.10"},
+        ]
+    }
+
+    def fake_urlopen(request, timeout=None):
+        captured["url"] = request.full_url
+        return FakeResponse(json.dumps(payload).encode("utf-8"))
+
+    monkeypatch.setattr(pypi_retriever.urllib.request, "urlopen", fake_urlopen)
+
+    result = retrieve("skimage", python_version="3.10")
+
+    assert result["distribution_name"] == "scikit-image"
+    assert captured["url"] == "https://pypi.org/simple/scikit-image/"
+    assert result["status"] == "resolved"
+    assert result["status"] != "mapping_unknown"
+    versions = [c["version"] for c in result["candidate_versions"]]
+    assert versions == ["0.24.0"]
 
 
 # --- PyPI client rate limiting (i4, issue #42 checklist item 10) ------------
