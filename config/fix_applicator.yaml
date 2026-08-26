@@ -1,0 +1,35 @@
+# Runtime configuration for FixApplicator (i5).
+
+# The i2-classified dataset FixApplicator re-joins against, by
+# notebook_execution_id, to recover repository/notebook identifiers that
+# scripts/rag_repair_agent.py's (i4) own output does not carry forward. See
+# docs/fix-applicator.md for why this re-join is necessary.
+dataset:
+  i2_path: "data/context-classification/dependency_error_contexts.jsonl"
+
+# The sibling FAIR Jupyter Docker reproducibility pipeline this thesis
+# builds on (docs/architecture-note.md §1). Its sqlite DB is the only
+# source of a repository's recorded `commit`, `requirements`, and `setups`
+# paths - none of that is persisted into this repo's own dataset files.
+#
+# This path is optional at runtime: if it does not exist or cannot be
+# opened, FixApplicator treats commit/requirements/setups metadata as
+# simply unavailable for that attempt (falls back to the target repository's
+# default branch, with no extra baseline setup.py installs) rather than
+# failing the attempt - commit pinning is a "prefer when available"
+# requirement (see docs/fix-applicator.md "Commit pinning"), not a hard
+# prerequisite for every attempt.
+upstream_docker_pipeline:
+  db_path: "~/era/computational-reproducibility-pmc-docker/data/db/db.sqlite"
+
+# Per-stage timeouts for one repair attempt. All independently bounded so a
+# single hung clone/build/run/checkout can never block a batch indefinitely.
+execution:
+  clone_timeout_seconds: 120
+  checkout_timeout_seconds: 60
+  build_timeout_seconds: 600
+  run_timeout_seconds: 900
+  cleanup_timeout_seconds: 30
+
+output:
+  path: "data/fix-attempts/fix_attempts.jsonl"

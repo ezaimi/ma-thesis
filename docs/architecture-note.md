@@ -208,6 +208,26 @@ The pip-only v1 restriction governs **repair eligibility only**, not explanation
 - Earlier drafts of this note (and of `thesis/architecture.tex`) placed one shared "in scope" gate before *both* LLMExplainer and RAGRepairAgent in the orchestrator sequence. That gate now applies to the RAGRepairAgent branch only; see the mermaid diagram and component-contracts table in §5.
 - `scope_status`, `exclusion_reason`, and `split` are computed by `scripts/prepare_dependency_dataset.py` (i1) and are now carried through `scripts/extract_error_contexts.py` (i2)'s enriched JSONL and into `run_llm_explainer.py` (i3)'s logged `input` block, so any later `RAGRepairAgent`/orchestrator implementation can gate on `scope_status` directly instead of re-deriving it.
 
+### 7.2 FixApplicator reality vs. the L3 design (i5 refinement)
+
+Two corrections, made explicit while implementing i5 (`FixApplicator`), to this note's §5/§6.1
+framing. Full detail and rationale in `docs/fix-applicator.md`.
+
+- **§5's "fix object + the repo's container" input is only half-available in practice.** The
+  persisted i4 fix object (`data/repair-proposals/*.jsonl`) does not by itself carry
+  `repository_id`/`notebook_id`/`notebook_name`/`repository_url` - FixApplicator re-joins it against
+  the i2 dataset (`data/context-classification/dependency_error_contexts.jsonl`) by
+  `notebook_execution_id` to recover them. §6.1's illustrative fix-object JSON (with top-level
+  `import_name`/`pypi_evidence`) also does not match `scripts/rag_repair_agent.py`'s actual persisted
+  shape (`final_action`/`final_install_name`/`final_version`/nested `input`/`retrieval_result`) -
+  i5 was built against the real, implemented shape, not this note's illustration.
+- **"The repo's container" does not exist to be reused.** The upstream Docker pipeline's per-repo
+  containers/images were never persisted on this machine. FixApplicator rebuilds an equivalent
+  environment from the same recipe (same base image, same baseline install loop, same `jupyter
+  nbconvert` execution command) on every attempt instead, and - going further than the original
+  pipeline itself - checks out each repository's recorded commit when the upstream pipeline's own DB
+  has one, since the original pipeline's own clone step does not pin to it.
+
 ---
 
 ## 8. Mapping to thesis objectives
@@ -215,8 +235,8 @@ The pip-only v1 restriction governs **repair eligibility only**, not explanation
 | Objective | Realized by | Status after L3 |
 |---|---|---|
 | O1 — Error explanation | LLMExplainer | designed |
-| O2 — Fix generation (PyPI RAG) | RAGRepairAgent + fix object (§6.1) | implemented (i4): `scripts/rag_repair_agent.py`, `scripts/pypi_retriever.py`, `scripts/compatibility_evidence.py` produce a validated, grounded fix object; FixApplicator (O3) still does not exist, so no proposal has been executed or confirmed |
-| O3 — Fix validation | FixApplicator (re-run in container) | designed |
+| O2 — Fix generation (PyPI RAG) | RAGRepairAgent + fix object (§6.1) | implemented (i4): `scripts/rag_repair_agent.py`, `scripts/pypi_retriever.py`, `scripts/compatibility_evidence.py` produce a validated, grounded fix object |
+| O3 — Fix validation | FixApplicator (re-run in container) | implemented (i5): `scripts/fix_applicator.py`, `scripts/docker_runner.py`, `scripts/notebook_outcome.py` apply a fix and re-run the notebook inside a rebuilt Docker environment; see §7.2 and `docs/fix-applicator.md` for the deviations this required from the design below |
 | O4 — Benchmark dataset | `repair_attempts` table (§6.2) | schema designed |
 | O5 — Pipeline integration | orchestrator + hook-in (§3, §5) | designed |
 | O6 — KG enrichment | `repair_attempts.rml.ttl` (§6.3) | designed |
