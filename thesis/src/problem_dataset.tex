@@ -1,0 +1,207 @@
+\chapter{Problem Analysis and Dataset}
+\label{chap:problem-dataset}
+
+This chapter answers two questions that must be kept separate: how large is
+the reproducibility problem in general, and what, concretely, does this
+thesis's own implementation operate on. The first question is answered by
+numbers from the original, full-scale FAIR Jupyter study. The second is
+answered by a much smaller, precisely defined dataset derived from the newer
+Docker-based pipeline. The two are related -- the second is a residual
+subset of the first kind of failure -- but they are not the same numbers, and
+this chapter does not mix them.
+
+\section{Scale of the Problem (L1)}
+\label{sec:pd-l1}
+
+The original FAIR Jupyter study executed every notebook it collected using a
+fresh conda environment per repository~\cite{samuel2024gigascience}. Across
+that full run:
+
+\begin{itemize}
+  \item Total notebooks executed: \textbf{10,389}
+  \item \texttt{ModuleNotFoundError}: 5,562 (53.5\%)
+  \item \texttt{ImportError}: 1,014 (9.8\%)
+  \item Combined dependency-related failures: \textbf{6,576 (63.3\%)}
+\end{itemize}
+
+In other words, roughly two out of every three executed notebooks failed for
+a dependency-related reason. The missing modules were dominated by
+biomedical and machine-learning packages, consistent with the PubMed Central
+origin of the dataset: \texttt{anndata} (1258 occurrences),
+\texttt{scanpy} (423), \texttt{pandas} (177), \texttt{cemba\_data} (176),
+\texttt{tensorflow} (149), \texttt{Bio} (108), and \texttt{fastai} (103) were
+the most frequently missing modules.
+
+These numbers exist to establish that dependency failure is a large-scale,
+systematic problem, not an edge case worth ignoring. \textbf{They are not the
+dataset this thesis's implementation runs on.} They come from the earlier
+conda-based run of the pipeline, before the Docker-based extension described
+next.
+
+\section{The Working Dataset (I1)}
+\label{sec:pd-i1}
+
+\subsection{Why the Docker Pipeline, Not the Conda Run}
+\label{sec:pd-why-docker}
+
+The newer, containerised pipeline~\cite{samuel2025docker} re-executes each
+repository inside its own Docker container. Containerisation resolves many
+of the failures counted in \Cref{sec:pd-l1} that were really caused by a
+missing system tool or an operating-system mismatch rather than by the
+notebook's Python dependencies. What is left over after containerisation --
+notebooks that still fail even inside a container built specifically for
+them -- is a cleaner, more targeted signal of a genuine dependency problem.
+This is why the Docker pipeline, not the original conda run, was chosen as
+the integration target: its residual failures are exactly the gap this
+thesis is meant to close, and its result schema already tags each failure
+with a pre-computed \texttt{error\_category}, which removes the need to
+re-implement failure detection from scratch.
+
+\subsection{Source and Filtering}
+\label{sec:pd-source}
+
+The working dataset is derived from the Docker pipeline's own result
+database (\texttt{notebook\_executions} table). Its existing categorisation
+routine already maps two exception types into a bucket called
+\texttt{DEPENDENCY\_ERROR}: \texttt{ModuleNotFoundError} and
+\texttt{ImportError}. These two types were kept, unchanged, as this thesis's
+scope, for two reasons: they are exactly what the upstream pipeline already
+flags as dependency-related, and, taken together, they cover both a package
+being completely absent and a package being present but missing a specific
+name the notebook tries to import.
+
+Filtering every row where \texttt{error\_category = 'DEPENDENCY\_ERROR'}
+yields \textbf{214} rows: 172 \texttt{ModuleNotFoundError} and 42
+\texttt{ImportError}. This extraction and every count in this section is
+produced by \texttt{scripts/prepare\_dependency\_dataset.py} (implementation
+step I1), and is written out as a CSV file plus a machine-readable statistics
+file so that the numbers can be independently recomputed.
+
+\subsection{Repair Scope: Why pip-Only}
+\label{sec:pd-scope}
+
+Not every one of the 214 rows can be repaired the same way. Version~1 of the
+repair layer is restricted, deliberately, to dependency problems that a
+single \texttt{pip install} command can fix: installing a missing package,
+or pinning a specific version. This scope decision was made for a concrete
+reason: it keeps the first version of the system controlled and measurable.
+A repair action that also has to reason about system-level packages
+(installed with \texttt{apt}, not \texttt{pip}) or about renaming an import
+path inside the notebook's own code introduces a second, much larger kind of
+decision that this thesis does not attempt to automate yet.
+
+Applying this scope split the 214 rows into two groups.
+
+\begin{table}[h]
+  \centering
+  \begin{tabular}{|l|r|p{6.3cm}|}
+    \hline
+    \textbf{Subtype} & \textbf{Count} & \textbf{Meaning} \\
+    \hline
+    \texttt{missing\_package} & 179 & The imported module is genuinely absent. \\
+    \hline
+    \texttt{wrong\_version} & 21 & The module is present, but the notebook imports a name that no longer exists in the installed version. \\
+    \hline
+    \texttt{system\_library} & 10 & A missing shared object file (e.g.\ \texttt{libxcb.so.1}), installable only with \texttt{apt}, not \texttt{pip}. \\
+    \hline
+    \texttt{mapping\_unknown} & 4 & An ambiguous local or path-shadowed name (e.g.\ \texttt{utils}) that cannot safely be mapped to a PyPI package. \\
+    \hline
+  \end{tabular}
+  \caption{Dependency-error subtypes across the 214-row working dataset.}
+  \label{tab:pd-subtypes}
+\end{table}
+
+The 10 \texttt{system\_library} rows are excluded because they need
+\texttt{apt}-level installation, which is outside the pip-only scope by
+definition; a missing shared library cannot be fixed by any pip command,
+however it is phrased. The 4 \texttt{mapping\_unknown} rows are excluded
+because their failing name (for example a generic module called
+\texttt{utils}) cannot be safely resolved to one specific PyPI package
+without guessing -- and guessing a package name is exactly the kind of
+unfounded suggestion this thesis's PyPI-grounding design
+(\Cref{chap:architecture}) is built to avoid. This leaves \textbf{200 usable}
+rows and \textbf{14 excluded} rows.
+
+\begin{table}[h]
+  \centering
+  \begin{tabular}{|l|r|p{7.5cm}|}
+    \hline
+    \textbf{Split} & \textbf{Count} & \textbf{Purpose} \\
+    \hline
+    \texttt{dev} & 13 & Used to design and manually sanity-check the explanation and repair prompts (\Cref{chap:methodology}). \\
+    \hline
+    \texttt{evaluation} & 187 & Usable rows reserved for the eventual full-scale repair evaluation (\Cref{chap:future-work}); not yet run at the time of writing. \\
+    \hline
+    \texttt{excluded} & 14 & Outside the pip-only v1 repair scope; still explained, never repaired (\Cref{sec:pd-explanation-scope}). \\
+    \hline
+  \end{tabular}
+  \caption{Split policy over the 214-row working dataset.}
+  \label{tab:pd-splits}
+\end{table}
+
+It is important not to read the 187-row \texttt{evaluation} split as already
+evaluated. Splitting the data this way only \emph{reserves} those rows for a
+later, controlled repair run; at the implementation stage this thesis
+reports, that run has not yet happened (\Cref{chap:future-work}).
+
+\subsection{Explanation Scope Is Wider Than Repair Scope}
+\label{sec:pd-explanation-scope}
+
+One further decision, made explicit only while building the repair
+component in step I4, deserves stating clearly here because it affects every
+later chapter. The pip-only restriction above governs \emph{repair}
+eligibility only. It does not restrict \emph{explanation}. All 214 rows,
+including the 14 excluded ones, still receive a plain-language explanation
+of their failure (objective O1); only the 200 usable rows are additionally
+passed on to the repair-proposal and fix-application components (objectives
+O2 and O3). A researcher whose notebook fails because of a missing system
+library still deserves to be told what went wrong, even though this
+thesis's current repair layer cannot fix that particular case automatically.
+
+\subsection{The Most Common Failing Modules}
+\label{sec:pd-top-modules}
+
+\begin{table}[h]
+  \centering
+  \begin{tabular}{|l|r||l|r|}
+    \hline
+    \textbf{Module} & \textbf{Occurrences} & \textbf{Module} & \textbf{Occurrences} \\
+    \hline
+    \texttt{pkg\_resources} & 22 & \texttt{keras} & 7 \\
+    \hline
+    \texttt{sklearn} & 16 & \texttt{scipy} & 7 \\
+    \hline
+    \texttt{rpy2} & 15 & \texttt{skimage} & 6 \\
+    \hline
+    \texttt{numpy} & 14 & \texttt{dms\_variants} & 4 \\
+    \hline
+    \texttt{cana} & 12 & \texttt{statsmodels} & 4 \\
+    \hline
+    \texttt{celloracle} & 12 & \texttt{libxcb.so.1} & 3 \\
+    \hline
+  \end{tabular}
+  \caption{Most frequent failing modules in the working dataset (top 12 of 20 recorded).}
+  \label{tab:pd-top-modules}
+\end{table}
+
+Several of these entries already hint at a recurring implementation problem
+addressed in \Cref{chap:methodology}: \texttt{sklearn} is not the PyPI
+package name (it is \texttt{scikit-learn}), and \texttt{pkg\_resources} is
+not an installable package at all but a module bundled with
+\texttt{setuptools}. A repair layer that assumed a Python import name is
+always also its own pip package name would fail on exactly the most common
+cases in this dataset.
+
+\section{Summary}
+\label{sec:pd-summary}
+
+The reproducibility problem is large at the scale of the full conda-based
+FAIR Jupyter run (\Cref{sec:pd-l1}: 6,576 dependency-related failures out of
+10,389 executed notebooks). This thesis does not attempt to repair that
+entire set. It operates on a precisely defined, much smaller residual
+subset: the 214 dependency-error rows still present after the newer Docker
+pipeline's containerisation, of which 200 fall inside the pip-only v1 repair
+scope and 13 of those were used only for prompt design, leaving 187 rows
+reserved, but not yet used, for a full evaluation. Keeping these numbers
+distinct throughout the rest of this thesis avoids overstating what has
+actually been measured.

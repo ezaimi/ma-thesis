@@ -1,0 +1,220 @@
+\chapter{Current Validation and Observations}
+\label{chap:validation}
+
+This chapter reports two different kinds of evidence, and keeps them
+clearly apart. The first is an automated test suite that checks each
+component's logic in isolation, against mocked external systems. The
+second is a small, real-system pilot that checks whether the same
+components behave correctly against the real PyPI registry, a real Ollama
+model, a real Docker daemon, and real GitHub repositories. Neither of these
+is the thesis's final evaluation, which requires running the full 187-row
+evaluation split described in \Cref{chap:problem-dataset} and has not yet
+been performed (\Cref{chap:future-work}).
+
+\section{Automated Testing}
+\label{sec:v-testing}
+
+At the implementation state this thesis reports, the repository's test
+suite contains \textbf{310 passing tests}, organised by the component they
+exercise.
+
+\begin{table}[h]
+  \centering
+  \begin{tabular}{|p{5.2cm}|r|p{5.8cm}|}
+    \hline
+    \textbf{Area} & \textbf{Tests} & \textbf{What is checked} \\
+    \hline
+    Context extraction and classification (I2) & 9 &
+      Root-cause hints, confidence levels, and the legacy-hint
+      acceptance/rejection logic from \Cref{sec:m-classification}. \\
+    \hline
+    Explanation schema, prompt rendering, and runner (I3) & 29 &
+      Prompt template rendering, JSON schema validation, and the
+      retry-on-failure logic from \Cref{sec:m-explanation}. \\
+    \hline
+    PyPI retrieval and compatibility evidence (I4) & 120 &
+      Import-name mapping, candidate-version filtering, Python-compatibility
+      checks, and the compatibility-evidence registry lookup from
+      \Cref{sec:m-repair-retrieval,sec:m-repair-compat}. \\
+    \hline
+    Repair proposal validation and agent orchestration (I4) & 78 &
+      Grounding validation, argument-list construction, and rejection of
+      an invented name or an out-of-range version, from \Cref{sec:m-repair}. \\
+    \hline
+    Fix application, Docker orchestration, and outcome classification (I5) & 74 &
+      Command re-validation, the dataset re-join, outcome classification,
+      and cleanup behaviour, from \Cref{sec:m-fixapply}. \\
+    \hline
+    \textbf{Total} & \textbf{310} & \\
+    \hline
+  \end{tabular}
+  \caption{Automated tests by component area, at the I5 implementation state.}
+  \label{tab:v-tests}
+\end{table}
+
+Dataset preparation (I1) has no dedicated automated test file of its own;
+instead, its output is checked by independently recomputing the counts in
+\Cref{chap:problem-dataset} directly from its output files and confirming
+they agree exactly, which they do.
+
+Across these areas, the tests specifically exercise: rejection of malformed
+or schema-invalid model output; rejection of a repair proposal that invents
+a package name or a version outside the retrieved evidence; the shell-safety
+checks described in \Cref{sec:m-fixapply}, including a static check that
+neither \texttt{shell=True}, \texttt{os.system}, \texttt{eval}, nor
+\texttt{exec} appears anywhere in the components that build or run a
+command; the three-outcome classification logic, including the conservative
+same-error check; and cleanup behaviour under both success and failure. All
+of this runs against mocked subprocesses, a mocked Ollama endpoint, and
+mocked HTTP responses. This is deliberate and also a limitation: a mocked
+test can prove a component's logic is internally consistent, but, as
+\Cref{sec:m-fixapply-bugs} already showed for three real bugs it could not
+have caught, it cannot prove the component behaves correctly against a real
+operating system, a real Docker daemon, or a real network. That is exactly
+what the pilots below were run to check.
+
+\section{I4 Implementation Validation}
+\label{sec:v-i4}
+
+\subsection{Retrieval Against Real PyPI}
+
+The five import names used in the original L5 design check
+(\texttt{sklearn}, \texttt{umap}, \texttt{pkg\_resources}, \texttt{scipy},
+\texttt{dms\_variants}) were re-checked against the real, production
+\texttt{retrieve()} entry point and the live PyPI registry. All four mapped
+names resolved correctly to their real PyPI distributions with plausible,
+current candidate versions; \texttt{dms\_variants}, which has no verified
+mapping, correctly returned \texttt{mapping\_unknown} with no PyPI request
+made at all, confirming under real conditions -- not only in a mocked test
+-- that an unmapped import never reaches the network.
+
+A later, separate check confirmed a fix to the mapping table itself.
+\texttt{cv2} and \texttt{skimage} are both common, usable failing modules in
+the dataset (\Cref{tab:pd-top-modules}) that had no entry in
+\texttt{config/package\_mapping.yaml}, so the retriever returned
+\texttt{mapping\_unknown} for both instead of resolving them. Adding
+\texttt{cv2: opencv-python} and \texttt{skimage: scikit-image} was checked
+against the real PyPI registry, alongside a regression check confirming
+that the existing \texttt{sklearn} mapping still resolved correctly and was
+not disturbed by the addition.
+
+\subsection{Repair Proposals Against a Real Model}
+
+A small pilot ran \texttt{rag\_repair\_agent.py}'s real entry point, using a
+real local Ollama model, over four records:
+
+\begin{itemize}
+  \item An excluded, \texttt{system\_library} record correctly abstained
+        with zero PyPI or Ollama calls, confirming the eligibility gate
+        works under real conditions.
+  \item A \texttt{missing\_package} record (\texttt{sklearn}) timed out
+        twice under the originally configured 120-second ceiling, then
+        succeeded on the first attempt once the ceiling was raised to 300
+        seconds -- the direct evidence behind the timeout change reported
+        in \Cref{sec:m-repair}.
+  \item The same record, rerun at 300 seconds, produced a schema-valid,
+        grounded proposal: install \texttt{scikit-learn}.
+  \item A \texttt{wrong\_version} record (the \texttt{scipy.integrate.cumtrapz}
+        case from \Cref{tab:m-compat}) produced a grounded
+        \texttt{pin\_version} proposal for \texttt{scipy==1.13.1}, using the
+        real compatibility-evidence intersection on the first attempt.
+\end{itemize}
+
+\subsection{What This Pilot Does and Does Not Show}
+
+It shows that real PyPI retrieval, real import-name mapping, and real model
+proposal generation work end to end, and that timeout and retry behaviour
+degrades safely rather than hanging or fabricating a result. It does not
+show an installed package, a modified environment, or a re-executed
+notebook -- none of that happened at this step, by design; validating a
+proposal is FixApplicator's job, covered next.
+
+\section{I5 Implementation Validation}
+\label{sec:v-i5}
+
+A second pilot ran \texttt{apply\_and\_validate()} against a real Docker
+daemon and real GitHub repositories, reusing already-validated I4 proposals.
+The upstream sibling database was found locked by another process during
+this pilot, which meant commit metadata for one lookup had to fall back to
+its documented "unavailable" behaviour -- itself a real, unplanned exercise
+of that fallback path, not a simulated one.
+
+\begin{table}[h]
+  \centering
+  \small
+  \begin{tabular}{|p{1.7cm}|p{3.2cm}|p{2.6cm}|p{6.0cm}|}
+    \hline
+    \textbf{Case} & \textbf{Original error} & \textbf{Fix applied} & \textbf{Result} \\
+    \hline
+    1 -- \texttt{sklearn} & \texttt{ModuleNot\-FoundError}: sklearn & install \texttt{scikit-learn} &
+      Original error gone; \texttt{still\_failing} on a later, unrelated \texttt{No module named 'pandas'}. \\
+    \hline
+    2 -- \texttt{scipy} & \texttt{ImportError}: cumtrapz & pin \texttt{scipy==1.13.1} &
+      Original error gone; \texttt{still\_failing} on a later, unrelated \texttt{No module named 'tf\_keras'}. \\
+    \hline
+    3 -- controlled failure & synthetic: non-existent repository & n/a &
+      \texttt{apply\_error}, failure stage \texttt{clone}; no Docker artefacts created. \\
+    \hline
+    4 -- \texttt{cv2} & \texttt{ModuleNot\-FoundError}: cv2 & install \texttt{opencv-python} &
+      Original error gone; \texttt{still\_failing} on a missing \emph{system} library (\texttt{libxcb.so.1}), a known characteristic of \texttt{opencv-python} on a minimal base image. \\
+    \hline
+    5 -- \texttt{sklearn} (2nd repo) & \texttt{ModuleNot\-FoundError}: sklearn & install \texttt{scikit-learn} &
+      Original error gone; \texttt{still\_failing} on a later, unrelated \texttt{No module named 'tensorflow'}. \\
+    \hline
+  \end{tabular}
+  \caption{I5 real-Docker pilot cases. Case 3 is a deliberately synthetic
+  infrastructure-failure test, not a dataset row.}
+  \label{tab:v-i5-cases}
+\end{table}
+
+Cases 4 and 5 were chosen deliberately, after cases 1--3, specifically to
+give the pilot the best possible chance of reaching a completely clean
+\texttt{fixed} result: both repositories have no declared requirements
+file, no \texttt{setup.py}, and exactly one notebook, minimising the chance
+of a second, unrelated dependency gap.
+
+\subsection{Key Observation: Fixing One Dependency Can Reveal Another}
+\label{sec:v-key-observation}
+
+Every one of the five real cases above -- spanning four different
+repositories, two different fix actions, and packages with no shared code
+lineage -- resolved the specific error it targeted and then failed again on
+a different, previously invisible problem. This is not a coincidence and it
+is not a defect in FixApplicator's own classification logic, which is
+separately unit-tested and proven capable of reporting a clean
+\texttt{fixed} result the moment one occurs. It is a property of the
+dataset: the Docker pipeline's error classification records only the
+\emph{first} import failure a notebook hits. A real research notebook can
+easily depend on several packages that are each individually missing; once
+the first one is repaired, execution proceeds further and can reach the
+next one, which was simply invisible until that point. The conservative
+\texttt{same\_as\_original\_error} check (\Cref{chap:methodology})
+correctly distinguished "a different, new problem" from "the fix did not
+work" in every one of these cases.
+
+No completely clean \texttt{fixed} outcome has yet been produced, despite a
+pilot deliberately designed to find one. This is stated plainly rather than
+minimised: a clean outcome remains achievable in principle on a
+single-dependency notebook, or with the future two-round repair mode
+feeding a \texttt{still\_failing} result's new error back into a second
+repair attempt (\Cref{chap:future-work}), but neither has been demonstrated
+yet.
+
+\section{Summary: Implementation Validation, Not Final Evaluation}
+\label{sec:v-summary}
+
+The results in this chapter show that every implemented component -- error
+classification, explanation, PyPI-grounded repair proposal generation, and
+fix application with re-execution -- works correctly end to end against
+real external systems, not only against mocked fixtures. They also
+surfaced concrete, fixable problems (a timeout set too low, two missing
+package mappings, three environment-specific bugs) that only a real pilot
+could have found.
+
+What these results do \emph{not} show is an overall repair success rate.
+Five real cases, or four PyPI names, or four repair proposals is not a
+sample large enough to support a general claim about how often this system
+repairs a dependency error, and this thesis makes no such claim. That
+question requires running the full 187-row evaluation split
+(\Cref{chap:problem-dataset}) under a controlled, orchestrated run, which is
+described as remaining work in \Cref{chap:future-work}.

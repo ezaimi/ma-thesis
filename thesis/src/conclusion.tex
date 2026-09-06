@@ -1,0 +1,64 @@
+\chapter{Conclusion}
+\label{chap:conclusion}
+
+This thesis set out to close a specific, narrow gap: the existing FAIR
+Jupyter reproducibility pipeline can detect that a notebook fails because of
+a missing or incompatible Python package, but it does not explain that
+failure or attempt to repair it. \Cref{chap:related-work} showed that the
+individual pieces needed to close this gap -- failure detection, automated
+dependency inference, and LLM-based program repair -- already existed
+separately in the literature, but not combined inside a reproducibility
+pipeline, grounded in live package data, and paired with a plain-language
+explanation.
+
+\Cref{chap:problem-dataset} through \Cref{chap:validation} reported what has
+actually been built to close it. Of the 214 dependency-error notebooks in
+the Docker pipeline's own residual failures, 200 fall inside this thesis's
+pip-only repair scope. A deterministic classifier decides scope and subtype
+before any language model is involved. An explanation component turns a raw
+error message into a plain-language, schema-validated description of what
+went wrong, for every one of the 214 rows, not only the repairable ones. A
+repair component proposes a fix using an open, locally-run model whose
+suggestion is checked, field by field, against live PyPI metadata and a
+small, hand-curated compatibility registry, so that a suggested package name
+or version is never a guess. A fix-application component applies that
+proposal inside a rebuilt environment equivalent to the one the notebook
+originally failed in, re-runs the whole notebook, and classifies the result
+into exactly three outcomes. All of this is implemented, covered by 310
+automated tests, and additionally checked against real PyPI, a real Ollama
+model, a real Docker daemon, and real GitHub repositories in a small pilot.
+
+That pilot produced one finding worth restating here because it shapes how
+the rest of this project should be read: every real case tried resolved its
+targeted dependency error and then uncovered a second, previously invisible
+one. This is not a weakness of the components built for this thesis --
+their own classification logic is separately proven capable of reporting a
+completely clean result -- but a real characteristic of research notebooks
+that depend on more than one package. It is also a direct argument for the
+two-round repair mode that is designed, but not yet built
+(\Cref{chap:future-work}): a single repair attempt is often only the first
+of several a real notebook may need.
+
+Several design decisions changed along the way, and \Cref{chap:methodology}
+recorded each one rather than hiding it behind a description that only
+matches the final result. The clearest examples are that the original
+containers this system was assumed to reuse for fix validation turned out
+never to have been preserved, so the environment is rebuilt from the same
+recipe instead; that the repair proposal's own persisted record does not
+carry a notebook's identity forward, so a re-join step had to be added; and
+that the explanation component's output format changed from free prose to
+strict, schema-validated JSON once it had to fit inside an automated
+pipeline. None of these changes weaken the system -- each was made because a
+concrete implementation problem required it, and each is now covered by a
+regression test.
+
+What remains is stated plainly in \Cref{chap:future-work}: an orchestrator
+that runs the existing components together over the full dataset without a
+person driving each attempt by hand, persistence of results into the
+designed \texttt{repair\_attempts} table and the FAIR Jupyter knowledge
+graph, and the full-scale evaluation -- including a one-round versus
+two-round comparison and a baseline comparison -- that would turn the pilot
+observations in \Cref{chap:validation} into a measured repair success rate.
+Reaching that point does not require redesigning any of the components
+described in this thesis; it requires connecting components that are
+already built, tested, and shown to work correctly on their own.
