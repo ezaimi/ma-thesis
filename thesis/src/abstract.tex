@@ -10,10 +10,16 @@ The working dataset is a residual set of 214 dependency-related failures
 recorded by the Docker-based pipeline, of which 200 fall inside a pip-only
 repair scope defined for this first version of the system. Given a failed
 notebook, a deterministic classifier decides its subtype and repair
-eligibility before any language model is consulted. An explanation
-component then produces a plain-language, schema-validated description of
-the failure for every record, independent of whether it can later be
-repaired. A repair component proposes a concrete fix using an open,
+eligibility before any language model is consulted.
+
+% TODO-FULL-RUN: update after the explanation component has been run over the complete dataset
+\fullrunupdate{An explanation component is designed to produce a
+plain-language, schema-validated description of the failure for every
+classified record, independent of whether it can later be repaired; it has
+not yet been run over the complete dataset.}
+
+A repair component proposes a concrete
+fix using an open,
 locally-run large language model whose suggestion is grounded in live
 metadata from the Python Package Index and validated, field by field,
 against that evidence, so that a proposed package name or version is never
@@ -22,18 +28,39 @@ an environment rebuilt to match the one the notebook originally failed in,
 re-executes the whole notebook, and classifies the result as fixed, still
 failing, or not meaningfully testable.
 
-All of these components are implemented and covered by 310 automated tests,
-and each has additionally been checked in a small pilot against real
-external systems: the live PyPI registry, a real local language model, a
-real Docker daemon, and real GitHub repositories. This pilot shows that
-every component behaves correctly end to end, and surfaces a recurring
-pattern in the dataset: a targeted repair reliably removes the specific
-error it addresses, but a notebook that depends on several packages often
-then reveals a second, previously hidden dependency problem further along.
+All of these components are implemented and covered by 332 automated tests.
 
-This thesis reports work completed through this implementation stage. Full
-orchestration of the pipeline over the complete dataset, persistence of
-results into a reusable benchmark table, enrichment of the existing
-knowledge graph with repair provenance, and a full-scale evaluation of
+% TODO-FULL-RUN: update after full orchestrated dataset execution
+\fullrunupdate{Each has additionally been checked in a small pilot against
+real external systems: the live PyPI registry, a real local language model,
+a real Docker daemon, and real GitHub repositories. This pilot shows that
+each component behaves correctly against its relevant real external system,
+and surfaces a recurring pattern in the dataset: a targeted repair reliably
+removes the specific error it addresses, but a notebook that depends on
+several packages often then reveals a second, previously hidden dependency
+problem further along. Neither the pilot's scope nor this pattern has yet
+been confirmed across the complete dataset.}
+
+A result-logging component now joins the classification, explanation, and
+repair records these components already produce into one persistent record
+per repair attempt, stored in a SQLite benchmark table, and an RDF mapping
+re-expresses that record and links it to the existing FAIR Jupyter knowledge
+graph.
+
+% TODO-FULL-RUN: update after full repair_attempts and knowledge-graph population
+\fullrunupdate{Both were executed against real, pilot-scale data and
+checked directly: the mapping produces syntactically valid RDF that links
+correctly to existing notebook resources, but neither has yet been
+populated from a full run.}
+
+All 214 dependency-error
+records were confirmed to share notebook identifiers with the inspected
+knowledge-graph source data.
+
+% TODO-FULL-RUN: rewrite once full orchestration and the full evaluation run exist
+\fullrunupdate{This thesis reports work completed through
+this implementation stage. Full orchestration of the pipeline over the
+complete dataset, population of the benchmark table and knowledge graph
+from a full run rather than a pilot sample, and a full-scale evaluation of
 repair success remain future work and are stated as such, rather than
-presented as already measured.
+presented as already measured.}

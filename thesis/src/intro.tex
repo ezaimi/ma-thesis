@@ -126,30 +126,45 @@ components back to the overall goal.
 \subsection{Status of This Thesis}
 \label{sec:intro-status}
 
-This thesis reports work completed through implementation step I5 of a
-staged plan (levels L1--L5 for design, steps I1--I7 for implementation, e0--e7
-for evaluation; see \Cref{chap:methodology} for the full breakdown). As of
-this stage:
+This thesis reports work completed through the result-logging and
+knowledge-graph implementation stage of a staged
+design-implementation-evaluation plan; \Cref{chap:methodology} explains,
+component by component,
+how each stage was actually built. As of this stage:
 
 \begin{itemize}
   \item Objectives O1, O2, and O3 are \textbf{implemented and tested}: a
         classification and explanation component, a PyPI-grounded repair
         proposal component, and a fix-application-and-re-execution component
-        all exist as working, unit-tested code, and have each additionally
-        been exercised against real external systems (a real Ollama model, the
-        real PyPI registry, a real Docker daemon, and real GitHub
-        repositories) in a small pilot.
-  \item Objectives O4, O5, and O6 -- the reusable benchmark dataset, full
-        pipeline integration, and knowledge-graph enrichment -- are
-        \textbf{designed but not yet built}. There is currently no single
-        program that runs all five steps over the whole dataset
-        automatically, no persistent results table, and no knowledge-graph
-        update. \Cref{chap:future-work} states exactly what remains.
-  \item The validation performed so far is a \textbf{small, real-system
-        pilot}, not the thesis's final evaluation. It shows that each
-        component behaves correctly against real data; it does not yet
-        measure an overall repair success rate across the dataset. That
-        measurement is planned future work.
+        all exist as working, unit-tested code.
+        % TODO-FULL-RUN: update after full orchestrated dataset execution
+        \fullrunupdate{Each has additionally been exercised against real
+        external systems (a real Ollama model, the real PyPI registry, a
+        real Docker daemon, and real GitHub repositories) only in a small
+        pilot, not yet over the complete dataset.}
+  \item Objectives O4 and O6 -- the reusable benchmark dataset and
+        knowledge-graph enrichment -- are \textbf{implemented and validated
+        at pilot scale}: a result-logging component persists one row per
+        repair attempt to a SQLite table, and an RDF mapping links each
+        logged attempt into the existing FAIR Jupyter knowledge graph.
+        % TODO-FULL-RUN: update after full repair_attempts and knowledge-graph population
+        \fullrunupdate{Both have been exercised and checked against real
+        pilot data, but neither has yet been run over the complete dataset.}
+  \item Objective O5, full pipeline integration, is \textbf{designed but not
+        yet built}: there is currently no single program that runs all five
+        repair-layer components over the whole dataset automatically.
+        % TODO-FULL-RUN: update after full orchestrated dataset execution
+        \fullrunupdate{The benchmark table and the knowledge graph so far
+        hold only pilot-scale records rather than the complete dataset.}
+        \Cref{chap:future-work} states exactly what remains.
+  % TODO-FULL-RUN: update once the full evaluation run exists
+  \item The validation performed so far is a
+        \textbf{small, real-system pilot}, not the thesis's final
+        evaluation.
+        \fullrunupdate{It shows that each component behaves correctly against
+        real data, including the result-logging and knowledge-graph
+        components; it does not yet measure an overall repair success rate
+        across the dataset. That measurement is planned future work.}
 \end{itemize}
 
 This distinction between what has been implemented and validated, and what

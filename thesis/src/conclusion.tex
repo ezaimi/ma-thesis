@@ -15,18 +15,35 @@ explanation.
 actually been built to close it. Of the 214 dependency-error notebooks in
 the Docker pipeline's own residual failures, 200 fall inside this thesis's
 pip-only repair scope. A deterministic classifier decides scope and subtype
-before any language model is involved. An explanation component turns a raw
-error message into a plain-language, schema-validated description of what
-went wrong, for every one of the 214 rows, not only the repairable ones. A
-repair component proposes a fix using an open, locally-run model whose
+before any language model is involved.
+
+% TODO-FULL-RUN: update after the explanation component has been run over the complete dataset
+\fullrunupdate{An explanation component is designed
+to turn a raw error message into a plain-language, schema-validated
+description of what went wrong, for every one of the 214 rows, not only the
+repairable ones -- a scope confirmed in a real, committed example
+(\Cref{sec:m-explanation-example}), though the explanation stage has not yet
+been run across the complete dataset.}
+
+A repair component proposes a fix using an open, locally-run model whose
 suggestion is checked, field by field, against live PyPI metadata and a
 small, hand-curated compatibility registry, so that a suggested package name
 or version is never a guess. A fix-application component applies that
 proposal inside a rebuilt environment equivalent to the one the notebook
 originally failed in, re-runs the whole notebook, and classifies the result
-into exactly three outcomes. All of this is implemented, covered by 310
-automated tests, and additionally checked against real PyPI, a real Ollama
-model, a real Docker daemon, and real GitHub repositories in a small pilot.
+into exactly three outcomes. A result-logging component then joins the
+classification, explanation, and repair records these four components
+already produced into one persistent record per repair attempt, and a
+knowledge-graph mapping re-expresses that record as RDF and links it to the
+notebook it repairs inside the existing FAIR Jupyter knowledge graph. All of
+this is implemented, covered by 332 automated tests.
+
+% TODO-FULL-RUN: update after full orchestrated dataset execution
+\fullrunupdate{It was additionally
+checked against real PyPI, a real Ollama model, a real Docker daemon, real
+GitHub repositories, and, for the logging and knowledge-graph components,
+the real Morph-KGC mapping engine and the knowledge graph's own source data
+-- but only in a small pilot, not yet over the complete dataset.}
 
 That pilot produced one finding worth restating here because it shapes how
 the rest of this project should be read: every real case tried resolved its
@@ -34,10 +51,13 @@ targeted dependency error and then uncovered a second, previously invisible
 one. This is not a weakness of the components built for this thesis --
 their own classification logic is separately proven capable of reporting a
 completely clean result -- but a real characteristic of research notebooks
-that depend on more than one package. It is also a direct argument for the
+that depend on more than one package.
+
+% TODO-FULL-RUN: update after completion of the bounded second repair round
+\fullrunupdate{It is also a direct argument for the
 two-round repair mode that is designed, but not yet built
 (\Cref{chap:future-work}): a single repair attempt is often only the first
-of several a real notebook may need.
+of several a real notebook may need.}
 
 Several design decisions changed along the way, and \Cref{chap:methodology}
 recorded each one rather than hiding it behind a description that only
@@ -48,17 +68,29 @@ recipe instead; that the repair proposal's own persisted record does not
 carry a notebook's identity forward, so a re-join step had to be added; and
 that the explanation component's output format changed from free prose to
 strict, schema-validated JSON once it had to fit inside an automated
-pipeline. None of these changes weaken the system -- each was made because a
-concrete implementation problem required it, and each is now covered by a
-regression test.
+pipeline. A further open question from the original design -- whether the
+Docker pipeline's own notebook and repository identifiers actually coincide
+with the ones the existing FAIR Jupyter knowledge graph was built from --
+was resolved only once it was checked directly against that graph's own
+source data, rather than assumed, confirming that the two agree on all 214
+records inspected and that no separate crosswalk table is needed to link a
+repair attempt to its notebook. None of these changes weaken the system --
+each was made because a concrete implementation problem or a genuine open
+question required it, and each is now covered by a regression test or a
+recorded check.
 
-What remains is stated plainly in \Cref{chap:future-work}: an orchestrator
-that runs the existing components together over the full dataset without a
-person driving each attempt by hand, persistence of results into the
-designed \texttt{repair\_attempts} table and the FAIR Jupyter knowledge
-graph, and the full-scale evaluation -- including a one-round versus
-two-round comparison and a baseline comparison -- that would turn the pilot
+% TODO-FULL-RUN: rewrite this closing paragraph once orchestration, the full
+% evaluation run, and full-scale knowledge-graph population exist
+\fullrunupdate{What remains is stated plainly in
+\Cref{chap:future-work}: an orchestrator
+that runs the existing components -- result logging and knowledge-graph
+enrichment now included -- together over the full dataset without a person
+driving each attempt by hand; the resulting full-scale population of the
+\texttt{repair\_attempts} table and the FAIR Jupyter knowledge graph, which
+today hold only the pilot-scale records reported in \Cref{chap:validation};
+and the full-scale evaluation -- including a one-round versus two-round
+comparison and a baseline comparison -- that would turn the pilot
 observations in \Cref{chap:validation} into a measured repair success rate.
 Reaching that point does not require redesigning any of the components
 described in this thesis; it requires connecting components that are
-already built, tested, and shown to work correctly on their own.
+already built, tested, and shown to work correctly on their own.}

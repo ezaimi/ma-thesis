@@ -10,7 +10,7 @@ Docker-based pipeline. The two are related -- the second is a residual
 subset of the first kind of failure -- but they are not the same numbers, and
 this chapter does not mix them.
 
-\section{Scale of the Problem (L1)}
+\section{Scale of the Problem}
 \label{sec:pd-l1}
 
 The original FAIR Jupyter study executed every notebook it collected using a
@@ -38,7 +38,7 @@ dataset this thesis's implementation runs on.} They come from the earlier
 conda-based run of the pipeline, before the Docker-based extension described
 next.
 
-\section{The Working Dataset (I1)}
+\section{The Working Dataset}
 \label{sec:pd-i1}
 
 \subsection{Why the Docker Pipeline, Not the Conda Run}
@@ -73,9 +73,9 @@ name the notebook tries to import.
 Filtering every row where \texttt{error\_category = 'DEPENDENCY\_ERROR'}
 yields \textbf{214} rows: 172 \texttt{ModuleNotFoundError} and 42
 \texttt{ImportError}. This extraction and every count in this section is
-produced by \texttt{scripts/prepare\_dependency\_dataset.py} (implementation
-step I1), and is written out as a CSV file plus a machine-readable statistics
-file so that the numbers can be independently recomputed.
+produced by \texttt{scripts/prepare\_dependency\_dataset.py}, and is written
+out as a CSV file plus a machine-readable statistics file so that the
+numbers can be independently recomputed.
 
 \subsection{Repair Scope: Why pip-Only}
 \label{sec:pd-scope}
@@ -132,29 +132,30 @@ rows and \textbf{14 excluded} rows.
     \hline
     \texttt{evaluation} & 187 & Usable rows reserved for the eventual full-scale repair evaluation (\Cref{chap:future-work}); not yet run at the time of writing. \\
     \hline
-    \texttt{excluded} & 14 & Outside the pip-only v1 repair scope; still explained, never repaired (\Cref{sec:pd-explanation-scope}). \\
+    \texttt{excluded} & 14 & Within explanation scope; excluded from automated repair (\Cref{sec:pd-explanation-scope}). \\
     \hline
   \end{tabular}
   \caption{Split policy over the 214-row working dataset.}
   \label{tab:pd-splits}
 \end{table}
 
-It is important not to read the 187-row \texttt{evaluation} split as already
-evaluated. Splitting the data this way only \emph{reserves} those rows for a
-later, controlled repair run; at the implementation stage this thesis
-reports, that run has not yet happened (\Cref{chap:future-work}).
+% TODO-FULL-RUN: update after full 187-row evaluation
+\fullrunupdate{It is important not to read the 187-row \texttt{evaluation}
+split as already evaluated. Splitting the data this way only
+\emph{reserves} those rows for a later, controlled repair run; at the
+implementation stage this thesis reports, that run has not yet happened
+(\Cref{chap:future-work}).}
 
 \subsection{Explanation Scope Is Wider Than Repair Scope}
 \label{sec:pd-explanation-scope}
 
-One further decision, made explicit only while building the repair
-component in step I4, deserves stating clearly here because it affects every
-later chapter. The pip-only restriction above governs \emph{repair}
-eligibility only. It does not restrict \emph{explanation}. All 214 rows,
-including the 14 excluded ones, still receive a plain-language explanation
-of their failure (objective O1); only the 200 usable rows are additionally
-passed on to the repair-proposal and fix-application components (objectives
-O2 and O3). A researcher whose notebook fails because of a missing system
+One further decision, made explicit only while building RAGRepairAgent,
+deserves stating clearly here because it affects every later chapter. The
+pip-only restriction above governs \emph{repair} eligibility only. It does
+not restrict \emph{explanation}. All 214 rows, including the 14 excluded
+ones, remain within the explanation scope defined for objective O1; only
+the 200 usable rows are additionally within scope for the repair-proposal
+and fix-application components (objectives O2 and O3). A researcher whose notebook fails because of a missing system
 library still deserves to be told what went wrong, even though this
 thesis's current repair layer cannot fix that particular case automatically.
 
@@ -202,6 +203,11 @@ entire set. It operates on a precisely defined, much smaller residual
 subset: the 214 dependency-error rows still present after the newer Docker
 pipeline's containerisation, of which 200 fall inside the pip-only v1 repair
 scope and 13 of those were used only for prompt design, leaving 187 rows
-reserved, but not yet used, for a full evaluation. Keeping these numbers
+reserved for a full evaluation.
+
+% TODO-FULL-RUN: update after full 187-row evaluation
+\fullrunupdate{That full evaluation has not yet been run.}
+
+Keeping these numbers
 distinct throughout the rest of this thesis avoids overstating what has
 actually been measured.

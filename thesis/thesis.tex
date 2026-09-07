@@ -14,6 +14,21 @@
 \usepackage{blindtext}
 \usepackage{subfigure}
 \usepackage{acronym}
+\usepackage{tikz}
+\usetikzlibrary{positioning,fit,arrows.meta,calc}
+\usepackage{xcolor}
+
+% Visible marker for text that must be revisited once the full orchestrated
+% run / full evaluation exists. Renders as a light-yellow highlighted block
+% so temporary status text is impossible to miss while reading or revising.
+\newcommand{\fullrunupdate}[1]{%
+  \par\noindent
+  \colorbox{yellow!25}{%
+    \parbox{\dimexpr\linewidth-2\fboxsep}{%
+      \textbf{UPDATE AFTER FULL RUN:} #1%
+    }%
+  }%
+}
 
 \hypersetup{%
 bookmarksnumbered=true, hyperindex=true,
@@ -82,7 +97,7 @@ Chair of Computer Engineering
 \end{center}
 \vspace{3cm}
 Submitted by: Erisa Zaimi\\
-Student ID: [Student ID]\\
+Student ID:\\
 Date: [Submission Date]\\
 \vspace{0.3cm}\\
 Supervising tutor: Dr. Sheeba Samuel \\
