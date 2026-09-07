@@ -138,25 +138,66 @@ Predicate choices:
 
 `docs/architecture-note.md` section 9 left this as an open item: the FAIR Jupyter KG is generated
 from the original conda-pipeline dataset, not the Docker pipeline this thesis builds on, so it was
-not known whether the two share notebook identifiers. This was checked directly, not assumed: all
-**214** rows of `data/context-classification/dependency_error_contexts.jsonl` were cross-checked
-against the FAIR Jupyter KG's own `repositories.csv`/`notebooks.csv` by `repository_id` and
-`notebook_id`, comparing the resolved repository path and notebook filename for an exact string
-match. Result: **214/214 matched** on both `repository_id` -> `repository` and `notebook_id` ->
-`name`, zero missing, zero mismatches. The Docker pipeline reuses the same `repositories`/`notebooks`
-primary keys as the conda-based corpus the KG was built from. No crosswalk table is required to link
-a repair attempt to its existing notebook node; `notebook_id` (recovered per section 6) is sufficient
-on its own.
+not known whether the two share notebook identifiers. This is checked directly, not assumed, and is
+now **reproducible from this repository** via `scripts/validate_kg_notebook_alignment.py`: for every
+row of `data/context-classification/dependency_error_contexts.jsonl` it looks up `repository_id` and
+`notebook_id` in the external FAIR Jupyter KG's own `repositories.csv`/`notebooks.csv` and compares
+the resolved repository path and notebook filename (and the notebook's own `repository_id` column,
+so a coincidental id collision across repositories cannot pass as a match) for an exact string match.
+
+The external FAIR Jupyter KG checkout is a separate upstream project (not part of this repository)
+and is not committed here - its `notebooks.csv` alone is 27,303 rows. The script instead takes the
+checkout's two source files as CLI arguments:
+
+```
+python scripts/validate_kg_notebook_alignment.py \
+  --i2 data/context-classification/dependency_error_contexts.jsonl \
+  --repositories-csv /path/to/fairjupyter-checkout/data/repositories.csv \
+  --notebooks-csv /path/to/fairjupyter-checkout/data/notebooks.csv
+```
+
+Example, run from WSL against a checkout under the Windows filesystem:
+
+```
+python scripts/validate_kg_notebook_alignment.py \
+  --repositories-csv /mnt/c/Users/zaimi/Documents/Thesis/fair-jupyter-kg/fairjupyter-main/data/repositories.csv \
+  --notebooks-csv /mnt/c/Users/zaimi/Documents/Thesis/fair-jupyter-kg/fairjupyter-main/data/notebooks.csv
+```
+
+Result, against the real 214-row dataset and a real local FAIR Jupyter KG checkout:
+
+```
+Records checked: 214
+Repository matches: 214/214
+Notebook matches: 214/214
+Missing: 0
+Mismatches: 0
+```
+
+The script exits `0` only when `Missing` and `Mismatches` are both zero; any missing or mismatched
+record is printed individually (with the reason) before the summary and the script exits `1`, so
+this is a genuine pass/fail check rather than a report to eyeball.
+`tests/test_validate_kg_notebook_alignment.py` covers the match/mismatch/missing/duplicate-source-id
+logic against small in-memory CSV fixtures and does not depend on the external checkout.
+
+This confirms no crosswalk table is required **for the FAIR Jupyter KG snapshot actually inspected
+here** - the Docker pipeline's `repository_id`/`notebook_id` values line up exactly with this
+checkout's `repositories`/`notebooks` primary keys. It does not imply every possible FAIR Jupyter KG
+snapshot, export, or future re-run of the upstream pipeline will necessarily assign the same ids; a
+different snapshot should be re-checked with this same script before relying on the same conclusion.
 
 ## 9. Validation
 
-- Full Python test suite: **332 passed** (`pytest tests/`), including the pre-existing i1-i5 suites.
+- Full Python test suite: **346 passed** (`pytest tests/`), including the pre-existing i1-i5 suites
+  and `tests/test_validate_kg_notebook_alignment.py` (section 8).
 - `tests/test_result_logger.py` - loader behavior, the duplicate-`notebook_execution_id` regression
   case described in section 2, the i5-missing run_id fallback, and end-to-end
   `log_repair_attempts()` runs against temporary JSONL fixtures.
 - `tests/test_export_repair_attempts_csv.py` - `notebook_id` resolution, CSV header/column order,
   `NULL` columns becoming empty CSV fields (not the string `"None"`), JSON blob round-tripping
   through the CSV writer/reader unchanged, and the missing-i2-context error.
+- `tests/test_validate_kg_notebook_alignment.py` - the section 8 alignment check's match/mismatch/
+  missing/duplicate-source-id logic, against small in-memory fixtures only.
 - `morph_kgc` (the same RML engine `run_fairjupyter_kg.sh` uses) was installed and run against a real
   `repair_attempts.csv` built from the real i2/i3/i4 pilot data plus a labeled synthetic i5 fixture
   (no live i5 output exists yet - see `docs/architecture-note.md` section 7.2 on why). The generated
@@ -164,12 +205,22 @@ on its own.
   predicate (not an empty-string literal), `repr:exception`/`repr:msg` appear only on the one row
   that actually has a post-repair error, and `prov:endedAtTime` is present and correctly typed
   `xsd:dateTime` for every row.
-- Notebook links were verified against the **real, unmodified** `notebooks.rml.ttl`, run against the
-  real `notebooks.csv` (627,127 triples), confirming the linked notebook IRIs exist there as
-  `rdf:type repr:Notebook` with the expected `pav:retrievedFrom` repository link - not merely
-  matching by string inspection.
-- The FAIR Jupyter KG checkout was confirmed untouched (directory listing identical before/after;
-  all validation output was written to a scratch location).
+- Notebook links were re-verified against the **real, unmodified** `notebooks.rml.ttl`, run against a
+  small real subset of the real `notebooks.csv`/`repositories.csv` (exactly the three notebooks
+  appearing in the pilot `repair_attempts.csv`: notebook_id 27, 35, 428). `run_fairjupyter_kg.sh`
+  itself materializes every `.rml.ttl` mapping as its own separate `morph_kgc` process and writes
+  each to its own `.nt` file (see the script) - so `notebooks.rml.ttl` and `repair_attempts.rml.ttl`
+  were likewise materialized as two independent `morph_kgc` calls and their output graphs unioned,
+  rather than fed into one shared mapping config (the two files reuse the same internal `map:`-scoped
+  local names for their triples-maps/logical-sources, e.g. `map:source_000`, which collide if loaded
+  together into a single config - harmless for the real per-file pipeline, but it means this
+  validation must mirror that per-file invocation rather than batch the mappings together). The
+  union confirmed all four generated `repr:hadRepairAttempt` links (`notebook_27` x2, `notebook_35`,
+  `notebook_428`) point to subjects the unmodified `notebooks.rml.ttl` independently produced as
+  `rdf:type repr:Notebook` - not merely matching by string inspection.
+- The FAIR Jupyter KG checkout was not modified: all mapping files and CSVs used above were read
+  directly or copied into a scratch location before materialization; nothing was written back into
+  the checkout.
 
 ## 10. Scope boundary / i7
 

@@ -257,9 +257,9 @@ sequence within one pass.
 | O1 — Error explanation | LLMExplainer | designed |
 | O2 — Fix generation (PyPI RAG) | RAGRepairAgent + fix object (§6.1) | implemented (i4): `scripts/rag_repair_agent.py`, `scripts/pypi_retriever.py`, `scripts/compatibility_evidence.py` produce a validated, grounded fix object |
 | O3 — Fix validation | FixApplicator (re-run in container) | implemented (i5): `scripts/fix_applicator.py`, `scripts/docker_runner.py`, `scripts/notebook_outcome.py` apply a fix and re-run the notebook inside a rebuilt Docker environment; see §7.2 and `docs/fix-applicator.md` for the deviations this required from the design below |
-| O4 — Benchmark dataset | `repair_attempts` table (§6.2) | schema designed |
+| O4 — Benchmark dataset | `repair_attempts` table (§6.2) | implemented and pilot-validated (i6): `scripts/result_logger.py` joins i2/i3/i4/i5 into the table; full-dataset population is future work (§10 of `docs/result-logger.md`) |
 | O5 — Pipeline integration | orchestrator + hook-in (§3, §5) | designed |
-| O6 — KG enrichment | `repair_attempts.rml.ttl` (§6.3) | designed |
+| O6 — KG enrichment | `repair_attempts.rml.ttl` (§6.3) | implemented and pilot-validated (i6): `scripts/export_repair_attempts_csv.py` + `mapping/rml_mapping/repair_attempts.rml.ttl` produce valid RDF linked to the existing FAIR Jupyter KG notebook nodes; full KG population is future work (`docs/result-logger.md`) |
 
 ---
 

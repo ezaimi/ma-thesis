@@ -13,11 +13,12 @@ notebooks.rml.ttl subject template is notebook_{id}, and the Part 2
 investigation confirmed notebook_id/repository_id are the exact same
 primary keys the Docker pipeline and the FAIR Jupyter KG both use for the
 same notebook - see docs/architecture-note.md section 6.3/9 and
-docs/kg-enrichment.md). This export recovers notebook_id per row the same
+docs/result-logger.md section 8). This export recovers notebook_id per row the same
 way FixApplicator already recovers repository/notebook metadata: by
 re-joining notebook_execution_id against the i2 dataset
 (scripts.fix_applicator.load_i2_index). notebook_id and repository_id were
-confirmed (across all 214 real dependency-error rows) to be the exact same
+confirmed (across all 214 real dependency-error rows, reproducibly -
+see scripts/validate_kg_notebook_alignment.py) to be the exact same
 primary keys the Docker pipeline and the FAIR Jupyter KG both use for the
 same notebook, so no crosswalk table is needed. A notebook_execution_id missing
 from the i2 dataset is a hard error, not a silently-null column - it
