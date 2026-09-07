@@ -9,10 +9,26 @@
 \usepackage{graphicx}           % use for pdfLatex
 \usepackage{makeidx} % f\"{u}r Benutzung des Befehls \printindex
 \usepackage[colorlinks=false]{hyperref}
+\usepackage{cleveref}
 \usepackage{tocbibind}
 \usepackage{blindtext}
-\usepackage{subfigure} 
+\usepackage{subfigure}
 \usepackage{acronym}
+\usepackage{tikz}
+\usetikzlibrary{positioning,fit,arrows.meta,calc}
+\usepackage{xcolor}
+
+% Visible marker for text that must be revisited once the full orchestrated
+% run / full evaluation exists. Renders as a light-yellow highlighted block
+% so temporary status text is impossible to miss while reading or revising.
+\newcommand{\fullrunupdate}[1]{%
+  \par\noindent
+  \colorbox{yellow!25}{%
+    \parbox{\dimexpr\linewidth-2\fboxsep}{%
+      \textbf{UPDATE AFTER FULL RUN:} #1%
+    }%
+  }%
+}
 
 \hypersetup{%
 bookmarksnumbered=true, hyperindex=true,
@@ -65,26 +81,27 @@ pdfborder=0 0 0 % Keine Box um die Links!
 
 \begin{center}
 
-\LARGE{\textbf{Title of the master thesis}}\\
+\LARGE{\textbf{Integrating Open Large Language Models into the Jupyter
+Notebook Reproducibility Pipeline}}\\
 \vspace{1cm}
 
 
-\Large{\textbf{Master Thesis}}\\ 
+\Large{\textbf{Master Thesis}}\\
 \vspace{1cm}
 Submitted in Fulfilment of the\\
 Requirements for the Academic Degree\\
-M.Sc.\\
+M.Sc. Web Engineering\\
 \vspace{0.5cm}
 Dept. of Computer Science\\
 Chair of Computer Engineering
 \end{center}
 \vspace{3cm}
-Submitted by: Max Mustermann\\
-Student ID: 111222\\
-Date: 12.12.1212\\
+Submitted by: Erisa Zaimi\\
+Student ID:\\
+Date: [Submission Date]\\
 \vspace{0.3cm}\\
-Supervising tutor: Prof. Dr. W. Hardt \\
-(further supervisors)
+Supervising tutor: Dr. Sheeba Samuel \\
+
 
 \end{titlepage}
 
@@ -93,9 +110,10 @@ Supervising tutor: Prof. Dr. W. Hardt \\
 %---------------------------------------------------------
 
 \addchap*{Abstract}
-\blindtext
+\input{src/abstract}
 \\\\
-\textbf{Keywords: Keyword1, Keyword2, Keyword3, ...max 5}
+\textbf{Keywords: Jupyter notebooks, computational reproducibility, large
+language models, retrieval-augmented generation, dependency repair}
 
 %---------------------------------------------------------
 % Table of Contents, List of figures, List of Tables
@@ -110,43 +128,19 @@ Supervising tutor: Prof. Dr. W. Hardt \\
 %---------------------------------------------------------
 \twocolumn
 \addchap{List of Abbreviations}
-\begin{acronym}[Bash]
- \acro{KDE}{K Desktop Environment}
- \acro{SQL}{Structured Query Language}
- \acro{Bash}{Bourne-again shell}
- \acro{JDK}{Java Development Kit}
- \acro{VM}{Virtuelle Maschine}
- \acro{I2C}[I²C]{Inter-Integrated Circuit}
- \acro{KDE}{K Desktop Environment}
- \acro{SQL}{Structured Query Language}
- \acro{Bash}{Bourne-again shell}
- \acro{JDK}{Java Development Kit}
- \acro{VM}{Virtuelle Maschine}
- \acro{I2C}[I²C]{Inter-Integrated Circuit}
- \acro{KDE}{K Desktop Environment}
- \acro{SQL}{Structured Query Language}
- \acro{Bash}{Bourne-again shell}
- \acro{JDK}{Java Development Kit}
- \acro{VM}{Virtuelle Maschine}
- \acro{I2C}[I²C]{Inter-Integrated Circuit}
- \acro{KDE}{K Desktop Environment}
- \acro{SQL}{Structured Query Language}
- \acro{Bash}{Bourne-again shell}
- \acro{JDK}{Java Development Kit}
- \acro{VM}{Virtuelle Maschine}
- \acro{I2C}[I²C]{Inter-Integrated Circuit}
- \acro{KDE}{K Desktop Environment}
- \acro{SQL}{Structured Query Language}
- \acro{Bash}{Bourne-again shell}
- \acro{JDK}{Java Development Kit}
- \acro{VM}{Virtuelle Maschine}
- \acro{I2C}[I²C]{Inter-Integrated Circuit}
- \acro{KDE}{K Desktop Environment}
- \acro{SQL}{Structured Query Language}
- \acro{Bash}{Bourne-again shell}
- \acro{JDK}{Java Development Kit}
- \acro{VM}{Virtuelle Maschine}
- \acro{I2C}[I²C]{Inter-Integrated Circuit}
+\begin{acronym}[PROV-O]
+ \acro{API}{Application Programming Interface}
+ \acro{APR}{Automated Program Repair}
+ \acro{FAIR}{Findable, Accessible, Interoperable, Reusable}
+ \acro{JSON}{JavaScript Object Notation}
+ \acro{KG}{Knowledge Graph}
+ \acro{LLM}{Large Language Model}
+ \acro{PMC}{PubMed Central}
+ \acro{PROV-O}{PROV Ontology}
+ \acro{PyPI}{Python Package Index}
+ \acro{RAG}{Retrieval-Augmented Generation}
+ \acro{RDF}{Resource Description Framework}
+ \acro{RML}{RDF Mapping Language}
 \end{acronym}
 
 \onecolumn
@@ -154,44 +148,45 @@ Supervising tutor: Prof. Dr. W. Hardt \\
 % Here starts the real work
 %---------------------------------------------------------
 
-\chapter{Introduction}
-\input{src/intro}  % Load Data from File intro.tex
-
-\chapter{Tables}
-\input{src/example_tables} % Load Data from File example_tables
-
-\chapter{Figures}
-\input{src/example_figures} % Load Data from File example_figures
-
-\chapter{Referencing}
-% Alternativ just write your text under \chapter like this example
-
-\blindtext \cite{autorenrichtlinien}
-
-\blindtext \footnote{Here is an area for your Notes}
-
-\blindtext \footnote{\cite{lnilatex} Seite 11}
-\blindtext \cite{lnilatex}
-\blindtext \cite{autorenrichtlinien,pepper1992grundlagen,chen2001audiovisual}
-
-
-\chapter{Subchapter}
-
-\section{sub 1}
-\blindtext[3]
-\section{sub 2}
-\blindtext[3]
-\subsection{sub 2.1}
-\blindtext[3]
-
-\subsection{sub 2.2}
-\blindtext[3]
+%---------------------------------------------------------
+% Chapter 1: Introduction
+%---------------------------------------------------------
+\input{src/intro}
 
 %---------------------------------------------------------
-% System Architecture (L3) -- place after Related Work,
-% before Implementation once those chapters exist.
+% Chapter 2: Background and Related Work
+%---------------------------------------------------------
+\input{src/related_work}
+
+%---------------------------------------------------------
+% Chapter 3: Problem Analysis and Dataset
+%---------------------------------------------------------
+\input{src/problem_dataset}
+
+%---------------------------------------------------------
+% Chapter 4: System Architecture
 %---------------------------------------------------------
 \input{src/architecture}
+
+%---------------------------------------------------------
+% Chapter 5: Methodology and Implementation
+%---------------------------------------------------------
+\input{src/methodology}
+
+%---------------------------------------------------------
+% Chapter 6: Current Validation and Observations
+%---------------------------------------------------------
+\input{src/validation}
+
+%---------------------------------------------------------
+% Chapter 7: Remaining Work
+%---------------------------------------------------------
+\input{src/future_work}
+
+%---------------------------------------------------------
+% Chapter 8: Conclusion
+%---------------------------------------------------------
+\input{src/conclusion}
 
 %---------------------------------------------------------
 % bibliography based on Springer Design

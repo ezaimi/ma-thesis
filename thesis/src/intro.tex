@@ -1,7 +1,189 @@
-% just insert your text here
+\chapter{Introduction}
+\label{chap:introduction}
 
-\blindtext[0]
+\section{Motivation}
+\label{sec:intro-motivation}
 
-\blindtext[4]
+Jupyter notebooks combine code, explanatory text, and results in a single
+document. This makes them a popular way to share computational research,
+especially in data-heavy fields such as biomedicine. A notebook published
+alongside a paper is meant to let another researcher see, and re-run, exactly
+how a result was produced.
 
-\blindtext[1]
+In practice, many published notebooks do not run at all when someone else
+tries them. Pimentel et al.~\cite{pimentel2019msr} collected 1.4~million
+notebooks from GitHub and attempted to execute a large subset of them: only
+24.11\% ran without errors, and only 4.03\% reproduced the results reported by
+their original authors. Samuel and Mietchen~\cite{samuel2024gigascience}
+found a similar pattern specifically for notebooks accompanying biomedical
+publications on PubMed Central, the domain this thesis also builds on. These
+numbers show that non-reproducible notebooks are not a rare exception; they
+are the common case.
+
+A large share of these failures is caused by dependencies, not by mistakes in
+the underlying research logic. A notebook is written against a particular set
+of installed Python packages. When it is later run in a different
+environment, a package may be missing entirely, or a newer version of a
+package may no longer provide the exact function the notebook expects. Both
+situations produce an error before the notebook can finish, even though the
+scientific code itself may be correct. The resulting error messages are often
+short and technical, for example \texttt{ModuleNotFoundError: No module named
+'sklearn'}, which is unhelpful to a researcher who is not a software
+developer and has no way to know that the fix is to install a package called
+\texttt{scikit-learn} rather than \texttt{sklearn}.
+
+\section{The FAIR Jupyter Pipeline and Its Remaining Gap}
+\label{sec:intro-gap}
+
+The FAIR Jupyter project has studied this problem at scale. Samuel and
+Mietchen~\cite{samuel2024gigascience} built a pipeline that downloads
+notebooks referenced by biomedical publications, executes them, and records
+whether each notebook ran and, if not, what error occurred. The results were
+organised into a queryable knowledge graph~\cite{samuel2024fairkg} so that
+patterns in notebook reproducibility could be studied directly. A more recent
+extension of the same pipeline~\cite{samuel2025docker} runs every repository
+inside its own Docker container before execution. Containerisation removes
+many failures that were really about a missing system tool or an
+incompatible operating system, rather than about the research code.
+
+Even this containerised pipeline stops at the point of \emph{detecting} a
+failure. When a notebook still does not run inside its container, the
+pipeline records the exception type and message and moves on. It does not
+explain the failure to a human reader, and it does not attempt a fix. Every
+notebook whose only problem is a missing or outdated Python package is left
+exactly as broken as it was found, even though such problems are, in
+principle, straightforward to repair by installing or pinning the right
+package version.
+
+This is the gap this thesis addresses: turning a detected, dependency-related
+notebook failure into an explained and, where possible, repaired one,
+automatically and without a person in the loop for every single notebook.
+
+\section{Contribution of This Thesis}
+\label{sec:intro-contribution}
+
+This thesis adds a repair layer on top of the existing Docker-based FAIR
+Jupyter pipeline. The pipeline's own contribution ends at logging a failure;
+this thesis begins exactly there. Given a notebook execution that failed with
+a dependency-related error, the added layer performs five steps:
+
+\begin{enumerate}
+  \item \textbf{Classify} the failure: is it really a dependency problem, and
+        if so, is it a missing package or an incompatible version?
+  \item \textbf{Explain} the failure in plain language, so that a researcher
+        without a programming background can understand what went wrong.
+  \item \textbf{Propose a repair}, using an open, locally-run large language
+        model (LLM) whose suggestion is grounded in live package metadata
+        from the Python Package Index (PyPI) rather than left to guess a
+        version number from training data.
+  \item \textbf{Apply the repair} inside an environment equivalent to the one
+        the notebook originally failed in, and re-run the whole notebook from
+        the beginning.
+  \item \textbf{Record the outcome}: whether the notebook now runs further,
+        still fails, or could not be meaningfully tested.
+  \end{enumerate}
+
+Grounding the repair suggestion in live PyPI data follows PLLM, the closest
+prior system to this one. Bartlett et
+al.~\cite{bartlett2025pllm} show that retrieval-augmented generation (RAG)
+against live package data measurably improves an LLM's dependency-repair
+accuracy compared to letting the model rely on what it happens to remember
+from training. This thesis adopts the same principle and applies it inside a
+reproducibility pipeline rather than to standalone Python scripts, and adds
+an explanation step and a re-execution-based validation step that PLLM does
+not have.
+
+\subsection{Objectives}
+\label{sec:intro-objectives}
+
+The work is organised around six objectives, first defined in the thesis
+vision document and used throughout this text to relate individual
+components back to the overall goal.
+
+\begin{table}[h]
+  \centering
+  \begin{tabular}{|l|p{10.5cm}|}
+    \hline
+    \textbf{Objective} & \textbf{Description} \\
+    \hline
+    O1 & Generate a plain-language explanation of a dependency-related failure. \\
+    \hline
+    O2 & Generate an automated, PyPI-grounded fix suggestion using an open LLM. \\
+    \hline
+    O3 & Apply the suggested fix and validate it by re-executing the notebook. \\
+    \hline
+    O4 & Compile a structured, reusable benchmark dataset of failures, fixes, and outcomes. \\
+    \hline
+    O5 & Integrate the above into the existing FAIR Jupyter pipeline without manual intervention. \\
+    \hline
+    O6 & Record repair outcomes as RDF triples in the FAIR Jupyter knowledge graph. \\
+    \hline
+  \end{tabular}
+  \caption{Thesis objectives, as defined in the vision document.}
+  \label{tab:intro-objectives}
+\end{table}
+
+\subsection{Status of This Thesis}
+\label{sec:intro-status}
+
+This thesis reports work completed through the result-logging and
+knowledge-graph implementation stage of a staged
+design-implementation-evaluation plan; \Cref{chap:methodology} explains,
+component by component,
+how each stage was actually built. As of this stage:
+
+\begin{itemize}
+  \item Objectives O1, O2, and O3 are \textbf{implemented and tested}: a
+        classification and explanation component, a PyPI-grounded repair
+        proposal component, and a fix-application-and-re-execution component
+        all exist as working, unit-tested code.
+        % TODO-FULL-RUN: update after full orchestrated dataset execution
+        \fullrunupdate{Each has additionally been exercised against real
+        external systems (a real Ollama model, the real PyPI registry, a
+        real Docker daemon, and real GitHub repositories) only in a small
+        pilot, not yet over the complete dataset.}
+  \item Objectives O4 and O6 -- the reusable benchmark dataset and
+        knowledge-graph enrichment -- are \textbf{implemented and validated
+        at pilot scale}: a result-logging component persists one row per
+        repair attempt to a SQLite table, and an RDF mapping links each
+        logged attempt into the existing FAIR Jupyter knowledge graph.
+        % TODO-FULL-RUN: update after full repair_attempts and knowledge-graph population
+        \fullrunupdate{Both have been exercised and checked against real
+        pilot data, but neither has yet been run over the complete dataset.}
+  \item Objective O5, full pipeline integration, is \textbf{designed but not
+        yet built}: there is currently no single program that runs all five
+        repair-layer components over the whole dataset automatically.
+        % TODO-FULL-RUN: update after full orchestrated dataset execution
+        \fullrunupdate{The benchmark table and the knowledge graph so far
+        hold only pilot-scale records rather than the complete dataset.}
+        \Cref{chap:future-work} states exactly what remains.
+  % TODO-FULL-RUN: update once the full evaluation run exists
+  \item The validation performed so far is a
+        \textbf{small, real-system pilot}, not the thesis's final
+        evaluation.
+        \fullrunupdate{It shows that each component behaves correctly against
+        real data, including the result-logging and knowledge-graph
+        components; it does not yet measure an overall repair success rate
+        across the dataset. That measurement is planned future work.}
+\end{itemize}
+
+This distinction between what has been implemented and validated, and what
+is still planned, is kept explicit throughout this document rather than
+blurred for the sake of a stronger-sounding narrative.
+
+\section{Thesis Structure}
+\label{sec:intro-structure}
+
+\Cref{chap:related-work} reviews prior work on notebook reproducibility,
+automated dependency resolution, and LLM-based program repair, and states
+the specific gap this thesis fills. \Cref{chap:problem-dataset} describes the
+scale of the reproducibility problem and how the concrete working dataset for
+this thesis was obtained. \Cref{chap:architecture} presents the system
+architecture: the five components introduced above, their contracts, and the
+data they exchange. \Cref{chap:methodology} is the core of the thesis: it
+explains, component by component, how each part was actually built, the
+decisions made along the way, and where the implementation ended up
+differing from the original design. \Cref{chap:validation} reports the
+automated test suite and the real-system pilot results obtained so far.
+\Cref{chap:future-work} separates what is finished from what remains.
+\Cref{chap:conclusion} closes the thesis with a summary of the contribution.

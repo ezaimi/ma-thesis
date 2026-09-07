@@ -1,0 +1,1250 @@
+\chapter{Methodology and Implementation}
+\label{chap:methodology}
+
+\Cref{chap:architecture} fixed what each component is responsible for and
+what data it exchanges with its neighbours. This chapter explains how each
+component was actually built: the concrete rules and libraries used, the
+decisions made while building it, and -- where relevant -- the point at
+which the real implementation forced a change to the design fixed in
+\Cref{chap:architecture}. The work is organised by component, following the
+project's own staged build order: the working dataset is prepared first,
+then classification and context extraction, then the explanation component,
+then the PyPI-grounded repair component, then fix application, and finally
+result logging and knowledge-graph enrichment, which joins the outputs of
+every earlier component into one persistent record.
+
+Full pipeline orchestration -- a single process that would run every
+component above together, unattended, over the complete dataset -- is not
+covered in this chapter because it has not been built yet; it is addressed
+directly in \Cref{chap:future-work}.
+
+\section{Implementation Overview}
+\label{sec:m-overview}
+
+Before the component-by-component account that follows, this section gives
+one condensed view of how the six implemented stages connect, so that the
+level of detail in the rest of the chapter does not obscure how the pieces
+form a single system.
+
+\begin{verbatim}
+Docker-pipeline dependency-error dataset (214 rows)
+    -> dataset preparation           scripts/prepare_dependency_dataset.py
+    -> context extraction /
+       classification                scripts/extract_error_contexts.py
+    -> LLMExplainer                  scripts/run_llm_explainer.py
+    -> RAGRepairAgent                scripts/rag_repair_agent.py
+    -> FixApplicator                 scripts/fix_applicator.py
+    -> ResultLogger (SQLite)         scripts/result_logger.py
+    -> CSV export                    scripts/export_repair_attempts_csv.py
+    -> RML mapping (Morph-KGC)       mapping/rml_mapping/repair_attempts.rml.ttl
+    -> FAIR Jupyter knowledge graph (RDF)
+\end{verbatim}
+
+Each arrow above is a data hand-off through a plain file or database, not a
+function call inside one running program: every stage is invoked as its own
+script against the previous stage's output, and no single process currently
+runs all of them in one pass over the whole dataset --
+\Cref{sec:orchestrator,chap:future-work} return to this point directly. The
+sections below follow this same order, one component at a time, and
+\Cref{sec:m-worked-example} then traces one concrete record through every
+stage to make the resulting data flow explicit.
+
+\section{Dataset Preparation}
+\label{sec:m-dataset}
+
+\Cref{chap:problem-dataset} already gave the resulting numbers for this
+stage: 214 dependency-error rows, 200 usable and 14 excluded, split 13/187
+between development and evaluation. This section explains how
+\texttt{scripts/prepare\_dependency\_dataset.py} produces those numbers, and
+why the rules behind them were chosen.
+
+The script reads the Docker pipeline's own \texttt{notebook\_executions}
+table and keeps every row where \texttt{error\_category = 'DEPENDENCY\_ERROR'}.
+For each kept row, it applies two independent decisions, deterministically
+and without any LLM involvement: a \emph{subtype} (is the module missing
+entirely, present but incompatible, a missing system library, or an
+ambiguous local name?) and a \emph{scope status} (is this row inside the
+pip-only v1 repair scope at all?). Both decisions rely only on simple,
+inspectable rules over the \texttt{error\_type} and \texttt{error\_message}
+fields the Docker pipeline already recorded -- for example, a message
+containing \texttt{".so"} or "shared object file" is classified as
+\texttt{system\_library}, and a failing module name drawn from a short list
+of known-ambiguous names (\texttt{utils}, \texttt{statistics},
+\texttt{config}, \texttt{helpers}, \texttt{src}) is classified as
+\texttt{mapping\_unknown}.
+
+Doing this filtering with plain rules, before any language model is
+involved, was a deliberate choice. A decision that determines whether a row
+is even eligible for automated repair should be explainable and
+reproducible on its own terms; an LLM's judgement about scope eligibility
+would be harder to audit and could silently change between runs of the same
+model. Keeping this gate deterministic also means every later component can
+trust \texttt{scope\_status} directly instead of re-deriving eligibility
+itself.
+
+The dataset is also split into three disjoint groups: 13 rows set aside for
+manually designing and sanity-checking the explanation and repair prompts
+(\Cref{sec:m-explanation,sec:m-repair}), 187 usable rows reserved for a
+later, controlled evaluation run, and the 14 excluded rows. Separating a
+small development sample from the evaluation set matters for the same
+reason it matters in any machine-learning setting: a prompt tuned by looking
+at a specific row, and then tested again on that same row, would give an
+optimistic and misleading impression of how well the prompt generalises.
+
+The script writes four output files: a CSV of the classified rows, a schema
+document describing every column, a statistics file with the counts used
+throughout this thesis, and a split-manifest file recording exactly which
+notebook execution IDs fall into which split, so the same split can be
+reproduced later rather than re-randomised.
+
+\section{Context Extraction and Error Classification}
+\label{sec:m-classification}
+
+\texttt{scripts/extract\_error\_contexts.py} takes each dataset row prepared
+above and adds two things: a more detailed root-cause hint with a confidence
+level, and, where possible, the actual source code around the failure. Every
+field the dataset-preparation stage already computed
+(\texttt{scope\_status}, \texttt{exclusion\_reason}, \texttt{split}) is
+carried through unchanged; this stage enriches every row regardless of
+scope, so an excluded row still receives full context for its explanation.
+
+\subsection{Root-Cause Hints}
+
+The subtype produced by dataset preparation is refined into one of seven
+root-cause hints:
+
+\begin{itemize}
+  \item \texttt{direct\_missing\_package} -- the module is genuinely absent;
+  \item \texttt{import\_distribution\_name\_mismatch} -- the import name
+        differs from its PyPI distribution name, for example
+        \texttt{sklearn} versus \texttt{scikit-learn};
+  \item \texttt{version\_or\_api\_incompatibility} -- a "cannot import name"
+        style failure;
+  \item \texttt{transitive\_dependency} -- a generic \texttt{ImportError}
+        not matching a more specific pattern;
+  \item \texttt{system\_level\_dependency} -- a missing shared library;
+  \item \texttt{local\_import\_or\_path\_issue} -- an ambiguous local module
+        name; and
+  \item \texttt{insufficient\_context} -- not enough information to decide.
+\end{itemize}
+
+Each hint is also assigned a confidence level -- high for a direct pattern
+match (a missing-module message, a "cannot import name" message, or a
+\texttt{.so} failure), medium for softer phrasing such as an "install" or
+"required" hint, and low for an ambiguous local module or a message that
+does not carry enough information to decide.
+
+\subsection{Recovering Source Context}
+
+Three tiers of context are attempted, in order of decreasing reliability.
+The first checks a legacy execution table inherited from an earlier run of
+the pipeline; because that table has no timestamp and was not produced by
+the same execution that generated the current dataset, it is treated as a
+hint, never as authoritative. A candidate row from that table is only
+accepted once its own final reported error is verified to match the current
+row -- not merely because the failing module's name happens to appear
+somewhere in the cell source. This distinction matters in practice: a cell
+that imports \texttt{pandas} before \texttt{sklearn} might fail on
+\texttt{pandas}, while the row being classified records an \texttt{sklearn}
+failure for the same notebook, and a naive substring match would wrongly
+treat the two as the same failure. Cross-checking against this legacy table
+shows that 162 of the 214 rows (76\%) have a matching notebook ID at all,
+but only around 40\% of those actually mention the correct failing module in
+their recorded traceback -- illustrating why this tier is used only as a
+low-confidence hint and never trusted on its own.
+
+The second tier, used only when explicitly requested, fetches the notebook
+and its dependency files directly from GitHub, using the repository's
+recorded commit where available and falling back to the \texttt{main} or
+\texttt{master} branch otherwise. The third tier falls back to the metadata
+already present from dataset preparation (error type, message, cell index,
+failing module) when no source can be recovered at all -- which is
+unavoidable here, because the repositories cloned during the original Docker
+pipeline run were never kept on this machine, so no local copy of any
+notebook's source exists unless it is fetched again.
+
+\subsection{Limitations}
+
+A few limitations follow directly from the above and are worth stating
+plainly, because they affect how confidently later components can rely on
+this context. Remote fetching is not pinned to the exact commit that
+originally failed unless that commit happens to still be resolvable, so a
+freshly fetched notebook can, in rare cases, differ slightly from the one
+that actually produced the recorded error. \texttt{error\_cell\_index}
+indexes into the notebook's full cell list, so a notebook edited since the
+original run can shift cell positions and misalign the index. Any
+unexpected per-row failure (a malformed row, a database error) falls back
+to a bare metadata-only record rather than aborting the whole batch, keeping
+one bad row from blocking the other 213.
+
+\section{LLM Explanation Component}
+\label{sec:m-explanation}
+
+LLMExplainer (\Cref{subsec:llmexplainer}) turns a classified failure into a
+plain-language account of what went wrong. It is the component most
+directly tied to the thesis title, and its role is deliberately narrow: it
+explains a failure, it never proposes how to fix one. This section covers
+what it is responsible for, why its scope differs from RAGRepairAgent's, how
+its model and runtime were chosen, how its output is structured and
+validated, and closes with a real record it produced.
+
+\subsection{Role and Separation from Repair}
+\label{sec:m-explanation-role}
+
+The prompt sent to the model instructs it to describe the failure in plain,
+non-technical language, using only the information supplied, and explicitly
+forbids it from suggesting a fix -- deriving a repair is RAGRepairAgent's
+job, kept structurally separate (\Cref{sec:m-repair}). This separation
+serves two purposes. First, it keeps each component's failure mode
+contained: an explanation that misjudges a detail is a readability problem,
+while a repair suggestion that misjudges a package name or version is
+executed inside a container, so the two carry very different risk and
+deserve very different validation. Second, it lets LLMExplainer's scope be
+wider than RAGRepairAgent's: the pip-only repair scope defined in
+\Cref{sec:pd-scope} restricts which rows may be \emph{repaired}, not which
+rows may be \emph{explained} (\Cref{sec:pd-explanation-scope}). A researcher
+whose notebook fails because of a missing system library still receives a
+plain-language explanation of the failure, even though the current repair
+layer cannot act on that particular case.
+
+\subsection{Model and Runtime Selection}
+
+The explanation and repair components share one open, locally-run model
+rather than each using a different one. \textbf{Gemma-2 9B} was selected as
+the primary model because PLLM~\cite{bartlett2025pllm}, the closest prior
+system, reports Gemma-2 9B with RAG as its own best-performing configuration
+for exactly this kind of dependency task. Using the same model for both
+explanation and repair keeps a later comparison between configurations
+clean: any difference in outcome can be attributed to the prompt or the
+retrieval design, not to a hidden difference in which model produced which
+part of the result. CodeLlama-13B and DeepSeek-Coder (7B and 13B) were kept
+as fallback candidates, motivated by Szalontai et
+al.~\cite{szalontai2024codellama} and a broader empirical comparison of
+code-specialised models~\cite{empiricalapr2025}, both of which report that
+smaller, code-specialised models can match or beat larger general-purpose
+ones on repair tasks; they were not needed in practice, since Gemma-2 9B
+performed adequately in the design-time sanity checks described below.
+
+Ollama was chosen as the serving runtime because it gives simple local
+access to a quantised model without setting up a GPU-serving stack, which
+is appropriate for a component running one notebook at a time rather than
+serving high-throughput traffic. A hardware check confirmed \texttt{gemma2:9b}
+runs on the available machine using 6.3~GB of memory, entirely on CPU, with
+a 4096-token context window -- workable, though slow, which later became
+relevant to a timeout decision described in \Cref{sec:m-repair}.
+
+\subsection{Structured Explanation Output}
+\label{sec:m-explanation-deviation}
+
+The explanation prompt was originally designed to produce plain,
+unstructured prose: two to four short sentences, explicitly forbidding
+headings, bullet points, or JSON. This was reasonable for a first
+design-time sanity check, but it does not fit an automated pipeline
+component whose output must be logged, validated, and machine-processed by
+later steps. Once \texttt{run\_llm\_explainer.py} came to implement this
+component, this requirement forced a change: the explainer now returns a
+single JSON object, validated against a fixed schema
+(\texttt{schemas/}\allowbreak\texttt{explanation.schema.json}) with exactly
+six fields:
+
+\begin{itemize}
+  \item \texttt{summary} -- a short, plain-language statement of what failed;
+  \item \texttt{root\_cause} -- why it failed, in the same plain language;
+  \item \texttt{evidence} -- a list of the concrete signals the explanation
+        is grounded in (the error type, the error message, the root-cause
+        hint);
+  \item \texttt{failing\_module} -- the module named in the explanation;
+  \item \texttt{explanation\_confidence} -- \texttt{high}, \texttt{medium},
+        or \texttt{low}; and
+  \item \texttt{limitations} -- what the explanation could not determine,
+        for example because only metadata, not source code, was available.
+\end{itemize}
+
+This is a deviation from the original design, not a silent one: the earlier
+prose template remains valid evidence of the original design intent, and the
+change was made because it was necessary, not because the original idea was
+wrong. It reuses a pattern already validated for the repair prompt
+(\Cref{sec:m-repair}): schema-constrained model output, followed by local
+parsing and validation, with one retry on failure. The schema's
+\texttt{explanation\_confidence} field is deliberately named differently
+from the classifier's own \texttt{confidence} field
+(\Cref{sec:m-classification}), because the two measure different things and
+can legitimately disagree -- a classifier can be highly confident it matched
+a known pattern while the model itself is only moderately confident it has
+correctly explained the underlying cause.
+
+\subsection{Prompt, Validation, and Retry}
+
+The prompt instructs the model to write in plain, non-technical language,
+to use only the information supplied (never inventing a version number, a
+file name, or a cause not visible in the error), and never to suggest a fix,
+as already noted above. The runner (\texttt{run\_llm\_explainer.py}) sends
+this prompt to \texttt{gemma2:9b} through Ollama, parses the response as
+JSON, and validates it against the schema. On invalid JSON, a schema
+violation, a timeout, or a model unavailability error, it retries once with
+a corrective prompt; if the second attempt also fails, the failure itself is
+logged rather than discarded, so that no row silently disappears from the
+results file. Each logged result keeps three things separate: the original
+classification-stage input metadata, the model and prompt configuration
+used, and the generated explanation together with its validation status,
+latency, and retry count -- so that a later reader can never confuse the
+original error text with text the model generated about it, and so that the
+result-logging stage (\Cref{sec:m-resultlogger}) can later join a record's
+explanation back to its originating notebook by
+\texttt{notebook\_execution\_id} without re-deriving any of this structure.
+
+\subsection{A Real Explanation Record}
+\label{sec:m-explanation-example}
+
+The following record, produced by \texttt{run\_llm\_explainer.py} and
+committed in
+\texttt{data/llm-explanations/\allowbreak explanation\_results.jsonl},
+illustrates the schema above on a real, already-classified failure
+(\texttt{notebook\_execution\_id}~8, a \texttt{ModuleNotFoundError} for
+\texttt{sklearn}):
+
+\begin{quote}
+\small
+\textbf{summary:} "The notebook execution failed because Python could not
+find the module 'sklearn'."\\[2pt]
+\textbf{root\_cause:} "The notebook imports 'sklearn', which is not
+available in the execution environment. The classifier also marks this as
+an import/distribution-name mismatch, meaning the import name may not
+directly match the package distribution name."\\[2pt]
+\textbf{evidence:} ["The error type is ModuleNotFoundError.", "The error
+message says: No module named 'sklearn'.", "The root\_cause\_hint is
+import\_distribution\_name\_mismatch."]\\[2pt]
+\textbf{failing\_module:} "sklearn"\\[2pt]
+\textbf{explanation\_confidence:} "high"\\[2pt]
+\textbf{limitations:} "Only metadata is available, so the exact failing
+cell and dependency files cannot be inspected."
+\end{quote}
+
+This record also shows the runner's own bookkeeping: it was produced with
+\texttt{prompt\_strategy: "few\_shot"}, needed a single attempt (no retry),
+and took 98{,}029~ms of generation time on the CPU-only hardware described
+above. This one record is not a claim about explanation quality across the
+dataset; it is included to make the schema in
+\Cref{sec:m-explanation-deviation} concrete against a real, not illustrative,
+output.
+
+\section{PyPI-Grounded Repair Generation}
+\label{sec:m-repair}
+
+RAGRepairAgent (\Cref{subsec:repairagent}) does not install anything. Its
+only job is to answer one question -- \emph{what repair should be
+attempted?} -- and to answer it safely: never inventing a package name,
+never inventing a version number, and never handing a later component a raw
+string to execute in a shell. This section explains how that is achieved.
+
+\subsection{Overall Flow}
+
+\begin{verbatim}
+classified dependency failure (usable)
+    -> identify the failing import
+    -> resolve the import name to a PyPI distribution name
+    -> query the PyPI registry for that distribution
+    -> filter the returned versions to a small, safe candidate set
+    -> for a version-incompatibility failure, intersect with
+       curated compatibility evidence
+    -> give the LLM only this grounded candidate set
+    -> validate the LLM's proposal against the same evidence
+    -> if valid, deterministically build the exact install command
+\end{verbatim}
+
+The design principle behind this flow is that the language model is never
+the only thing standing between an error message and a command that will
+later run inside a container. Four separate layers each have exactly one
+job, and each layer only trusts what the previous layer has already
+verified.
+
+\subsection{Layer 1: Deterministic Retrieval}
+\label{sec:m-repair-retrieval}
+
+Before any network request, the failing Python import name must be resolved
+to an installable PyPI distribution name. The two are frequently different:
+\texttt{sklearn} installs as \texttt{scikit-learn}, \texttt{cv2} as
+\texttt{opencv-python}, \texttt{skimage} as \texttt{scikit-image},
+\texttt{umap} as \texttt{umap-learn}, \texttt{pkg\_resources} as
+\texttt{setuptools}, and \texttt{Bio} as \texttt{biopython}. A small,
+explicit, hand-curated mapping table (\texttt{config/package\_mapping.yaml})
+holds every case the retriever is allowed to resolve; an import name absent
+from this table is never assumed to also be its own package name, and the
+retriever instead reports a \texttt{mapping\_unknown} status without making
+any PyPI request at all. This rule matters concretely for this thesis's own
+dataset: \texttt{sklearn} and \texttt{pkg\_resources} are, respectively, the
+second and first most common failing modules (\Cref{tab:pd-top-modules}), so
+getting this mapping right or wrong affects a large share of the dataset,
+not an edge case.
+
+Once resolved, the distribution's release metadata is retrieved from the
+official PyPI JSON Simple API
+(\texttt{GET /simple/\{distribution\}/}), normalising the name first
+according to PEP 503. This endpoint was chosen deliberately over the older
+project JSON endpoint's \texttt{releases} field, which PyPI's own
+documentation marks as deprecated for new integrations; the newer endpoint
+is the one PyPI recommends going forward. The returned files are grouped by
+release version, and a safe candidate set is computed by dropping
+unparseable files, pre-releases, and releases where every file is yanked,
+and by checking each release's declared \texttt{requires-python} against
+the runtime the notebook actually executed under.
+
+That runtime version is a fixed constant, \texttt{"3.10"}
+(\texttt{config/rag\_repair.yaml}), not looked up per notebook. This is not
+an approximation of convenience: the Docker pipeline builds every
+repository's container from the same template, with the base image
+hardcoded to \texttt{python:3.10-slim}, so every notebook this component
+processes genuinely ran under the same interpreter version. The
+notebook's own recorded kernel metadata is deliberately not used as a
+substitute, because it reflects what the notebook's original author had
+installed, which is frequently stale or missing, not what the Docker
+container the notebook actually failed in provides.
+
+The final candidate list is capped to five versions, newest first, to keep
+the amount of version metadata placed in the prompt bounded and readable.
+
+\subsection{Version Incompatibility Needs More Than PyPI Metadata}
+\label{sec:m-repair-compat}
+
+For a \texttt{wrong\_version} failure -- a "cannot import name" error --
+knowing that a release exists and supports the right Python version is not
+enough. PyPI's own Simple API specification (PEP 691) only exposes, per
+file, its filename, URL, hashes, required Python version, size, upload
+time, and yanked status; it says nothing about which functions or classes a
+given release actually provides. Proving that, for example,
+\texttt{scipy.integrate.cumtrapz} still exists in a specific SciPy release
+requires consulting that project's own documentation, not PyPI.
+
+This gap is closed with a small, hand-curated registry
+(\texttt{config/}\allowbreak\texttt{api\_compatibility\_evidence.yaml}). Each entry records one
+specific import symbol, the version range in which an official source
+confirms it still exists, and a link to that source. \Cref{tab:m-compat}
+lists the three patterns curated for this dataset, all covering symbols
+that were removed in a major SciPy or NumPy release.
+
+\begin{table}[h]
+  \centering
+  \begin{tabular}{|p{4.4cm}|p{1.6cm}|p{6.0cm}|}
+    \hline
+    \textbf{Symbol} & \textbf{Compatible with} & \textbf{Official source} \\
+    \hline
+    \texttt{scipy.integrate.\allowbreak cumtrapz} & \texttt{<1.14.0} & SciPy 1.14.0 release notes, "Expired deprecations" \\
+    \hline
+    \texttt{scipy.sparse.\allowbreak sputils.\allowbreak isshape} & \texttt{<1.14.0} & SciPy 1.14.0 release notes, cross-checked against SciPy's source repository \\
+    \hline
+    \texttt{numpy.\allowbreak VisibleDeprecationWarning} & \texttt{<2.0.0} & NumPy 2.0.0 release notes, "NumPy 2.0 Python API removals" \\
+    \hline
+  \end{tabular}
+  \caption{Curated API-compatibility evidence used for \texttt{wrong\_version} repairs.}
+  \label{tab:m-compat}
+\end{table}
+
+This registry is deliberately small and manual rather than an automated
+changelog crawler. Every entry was checked by hand against one official
+source and dated; a pattern absent from the registry receives no fabricated
+entry and simply yields no evidence, which means the affected row can only
+ever be repaired as \texttt{none}. This does not generalise automatically
+to unseen incompatibility patterns in a different notebook corpus -- it is
+scoped to what this thesis's own dataset actually contains, and is
+presented as such rather than as a general-purpose solution.
+
+\subsection{Layer 2: What the Language Model Actually Decides}
+
+The model receives only the grounded candidate set from Layer~1 -- never
+the raw, unfiltered PyPI response -- together with the evidence summary for
+a version-incompatibility case. From this, it proposes a structured JSON
+object: an \texttt{action} (\texttt{install}, \texttt{pin\_version}, or
+\texttt{none}), an \texttt{install\_name}, a \texttt{version} (for
+\texttt{pin\_version}, drawn only from the supplied candidates), and a short
+\texttt{rationale}. The model therefore selects the repair action from
+within the candidate set Layer~1 has already established, rather than
+receiving a decision made elsewhere and being asked only to phrase it.
+
+The schema actually validated against
+(\texttt{schemas/repair\_proposal.schema.json}) is narrower than an earlier
+design sketch that also asked the model to echo back the import name and a
+\texttt{pypi\_evidence} block. Both fields were dropped once this component
+came to be implemented: the import name is already known before the model
+is ever called, so echoing it proves nothing, and re-stating retrieval data
+in the model's own words only invites drift between what was actually
+retrieved and what the model claims was retrieved. The schema also
+enforces, through conditional rules, that \texttt{install} never carries a
+version, that \texttt{pin\_version} always carries both a name and a
+version, and that \texttt{none} carries neither.
+
+Critically, \textbf{the model never returns a command field.} An earlier
+draft of the prompt had the model produce the exact command string that
+would later run inside a container. That design was changed once it became
+clear what it implied: it would let free-text model output reach a field
+executed as a subprocess. The model now proposes only the three structured
+values above; the executable command is built afterwards, deterministically,
+described next.
+
+\subsection{Layers 3 and 4: Validation and Command Construction}
+
+Before anything the model proposed is used, a deterministic validator
+checks it against the same evidence Layer~1 already retrieved:
+\texttt{action} must be one of the three allowed values; a proposed
+\texttt{install\_name} must exactly match the distribution the retriever
+itself already resolved, not a name the model introduced; a proposed
+\texttt{version} must be literally present in the supplied candidate list,
+never a nearby or plausible-looking one; a \texttt{missing\_package}
+\texttt{install} additionally requires at least one candidate marked
+Python-compatible; and a \texttt{wrong\_version} \texttt{pin\_version}
+additionally requires that the compatibility-evidence lookup actually
+resolved. Every one of these string values is also checked against a narrow
+allow-list pattern that rejects a leading dash, whitespace, or shell
+metacharacters, as a second, independent safety layer beneath the exact-match
+checks. If any single check fails, the entire proposal is discarded and
+overridden to \texttt{action: "none"} -- nothing is "corrected" to a nearby
+safe value, because a corrected value is still a guess.
+
+Only once validation passes is the actual install command constructed, and
+only then, deterministically, as a list of argument tokens --
+\texttt{["python", "-m", "pip", "install", install\_name]}, or with
+\texttt{"install\_name==version"} for a version pin -- never as a single
+shell string. A separate, human-readable \texttt{command} field is also
+stored for logging, but it exists only for a reader's convenience and is
+never itself executed.
+
+If the model's response cannot be parsed, fails schema validation, fails
+grounding validation, times out, or the model is unavailable, the component
+retries once with the failure reason included in a corrective prompt.
+Exhausting that one retry always yields \texttt{action: "none"}: an
+unresolved failure is never allowed to fall through as if it had succeeded.
+
+\subsection{Runtime Configuration and a Timeout Correction}
+
+RAGRepairAgent shares its model with the explanation component
+(\texttt{gemma2:9b} through Ollama, temperature 0.1, top-p 0.9, at most 700
+generated tokens). One runtime parameter changed after real-world testing: the
+request timeout was raised from an initial 120 seconds to 300 seconds. This
+was not a guess -- a real pilot run (\Cref{chap:validation}) on CPU-only
+hardware recorded the same repair request timing out twice at 120 seconds
+and then succeeding on the first attempt once the ceiling was raised to 300
+seconds, on the same machine, with the same model. The underlying model was
+healthy throughout; the earlier value was simply too tight for slow,
+CPU-only generation. The retrieval client also enforces a short, bounded
+wait (0.5 seconds) between real PyPI requests, and at most one bounded retry
+on an HTTP 429 response, so that a batch run of many rows cannot
+accidentally overload the public registry.
+
+\subsection{The Implemented Result Shape}
+
+The result actually persisted by
+\texttt{scripts/rag\_repair\_agent.py} differs from the illustrative fix
+object in \Cref{subsec:fix-object}, as already noted there. Every result
+record carries, among other fields, \texttt{notebook\_execution\_id} as its
+only join key back to the rest of the dataset; an \texttt{eligibility} block
+recording whether the row was usable, excluded, or invalid; a nested
+\texttt{retrieval\_result} block holding everything Layer~1 found;
+\texttt{final\_action}, \texttt{final\_install\_name}, and
+\texttt{final\_version} as the validated outcome; the constructed
+\texttt{argv} list and its human-readable \texttt{command} string; and an
+overall \texttt{status} of \texttt{"success"} (a grounded proposal),
+\texttt{"abstained"} (a legitimate \texttt{none}, whether chosen by the
+model or forced by a failed check), or \texttt{"failed"} (every attempt was
+exhausted without ever producing a usable response). One field the
+illustrative design object showed at the top level, \texttt{import\_name},
+does not appear in the persisted record at all, because it is already
+present in the nested input block copied from the classification stage and
+did not need repeating -- a detail that becomes important in
+\Cref{sec:m-fixapply}, since it is exactly why FixApplicator cannot recover
+a notebook's identity from a RAGRepairAgent record alone.
+
+\section{Fix Application and Notebook Re-execution}
+\label{sec:m-fixapply}
+
+FixApplicator answers the question RAGRepairAgent deliberately leaves open:
+\emph{does the proposed repair actually work?} It contains no language
+model call anywhere -- it is a small, fully deterministic pipeline that
+applies an already-validated proposal, re-runs the notebook, and classifies
+what happened.
+
+\begin{verbatim}
+validated RAGRepairAgent proposal
+    -> re-join with the classification dataset by notebook_execution_id
+    -> re-validate install_name/version and rebuild the install command
+    -> reconstruct a Docker environment equivalent to the original
+    -> apply the fix inside that environment
+    -> re-run the notebook top to bottom
+    -> classify the outcome
+\end{verbatim}
+
+\subsection{Recovering Notebook Identity}
+
+The RAGRepairAgent result described above is joined to the rest of the
+dataset by \texttt{notebook\_execution\_id} alone; it does not carry the
+repository ID, notebook name, or repository URL forward. FixApplicator
+therefore looks up each record's \texttt{notebook\_execution\_id} in the
+classification dataset
+(\texttt{data/context-classification/\allowbreak dependency\_error\_contexts.jsonl}) to
+recover this identity before doing anything else. If a given ID is not
+found, or the matching record is missing one of these fields, the attempt is
+recorded as an infrastructure failure (\texttt{apply\_error}, failure stage
+\texttt{"join"}) rather than guessed -- the alternative, filling in a
+missing field with a default, would risk silently cloning or running the
+wrong repository.
+
+\subsection{Re-validating Rather Than Re-executing a Persisted Command}
+
+Even though RAGRepairAgent already validated its own proposal, FixApplicator
+does not execute the persisted \texttt{argv} as-is. It re-checks
+\texttt{install\_name} and \texttt{version} with the same safety check
+RAGRepairAgent itself uses, and rebuilds the argument list from scratch with
+the same function RAGRepairAgent used to build it in the first place. If the
+freshly rebuilt list does not match the one that was persisted, the record
+is rejected before anything runs. This is a second, independent enforcement
+of the same safety rule, not a redesign of it -- the two components
+agreeing confirms that no tampering or drift occurred between when the
+proposal was written and when FixApplicator reads it.
+
+\subsection{Rebuilding the Docker Environment}
+\label{sec:m-fixapply-docker}
+
+\Cref{chap:architecture} originally assumed FixApplicator would be handed a
+container from the repository's original run. In practice, the original
+per-repository containers from the upstream Docker pipeline were never kept
+on this machine -- there is simply nothing left to attach to. FixApplicator
+therefore rebuilds an equivalent environment from the same recipe on every
+attempt: the same base image (\texttt{python:3.10-slim}), the same
+\texttt{requirements.txt}-then-\texttt{setup.py} install sequence, and the
+same notebook execution command
+(\texttt{jupyter nbconvert --to notebook --execute --allow-errors}) the
+reference pipeline itself uses. This command, not a hand-written execution
+loop, is reused deliberately: it is the exact mechanism that produced the
+original dataset, so re-using it keeps the comparison fair. Only the one
+notebook that actually failed is executed, not every notebook in the
+repository, and it is always executed from the beginning, never resumed
+from the failing cell, because a notebook keeps state across cells and a
+partial re-run cannot prove a fix actually works.
+
+Two details differ from the reference pipeline on purpose. First, the build
+context is kept small and separate from the cloned repository, instead of
+placing build files directly inside the clone; this avoids sending an
+entire git history to the Docker daemon as build context and has no effect
+on the resulting image, since the repository is still bind-mounted into the
+container at run time exactly as the reference pipeline itself does.
+Second, the container runs as its default root user rather than mapping to
+a host user ID. This is necessary because the already-validated install
+command has no user-mapping flag of its own, and FixApplicator must never
+rewrite an argument list that has already passed validation; running the
+disposable, single-use container as root lets that unmodified command
+succeed without inventing a different command shape than the one
+RAGRepairAgent approved.
+
+\subsection{Commit Pinning}
+
+Where the upstream pipeline's own database has a recorded commit for a
+repository, FixApplicator checks out that exact commit before building
+anything, rather than staying on the repository's current default branch.
+This matters because a public GitHub repository can change after the
+original dataset was collected; without pinning, a later fix attempt could
+be tested against a different version of the notebook than the one that
+actually produced the original failure. Notably, the reference pipeline
+that originally produced this dataset does not do this itself -- it clones
+only the latest state of the default branch even though it records a
+commit -- so this is a case where the implementation goes further than the
+system it builds on. If the recorded commit cannot be checked out, this is
+treated as a specific infrastructure failure rather than a silent fallback
+to the current branch. The commit lookup itself is optional: if the
+upstream database is missing or cannot be read, FixApplicator simply
+proceeds without commit or baseline-setup metadata for that attempt rather
+than failing it outright.
+
+\subsection{Fix Application Safety}
+
+The install command is only ever executed as an explicit list of arguments,
+passed directly to a subprocess, never assembled into a shell string. Every
+external process this component invokes -- git and Docker included -- goes
+through an injectable runner as an argument list; a static check of the
+source code confirms that \texttt{shell=True}, \texttt{os.system},
+\texttt{eval}, and \texttt{exec} appear nowhere in it. If the fix
+installation itself fails inside the container, the container script stops
+immediately and the notebook is never executed -- running an unfixed
+notebook would validate nothing.
+
+\subsection{Outcome Classification}
+
+Exactly three outcomes are possible, matching the contract already fixed in
+\Cref{chap:architecture}; no fourth value is ever introduced.
+
+\begin{table}[h]
+  \centering
+  \begin{tabular}{|l|p{9.3cm}|}
+    \hline
+    \textbf{Outcome} & \textbf{Meaning} \\
+    \hline
+    \texttt{fixed} & The re-executed notebook produces no error output anywhere. \\
+    \hline
+    \texttt{still\_failing} & The fix installed and the notebook re-ran, but an error remains -- possibly the same error as before, possibly a different one further into the notebook. \\
+    \hline
+    \texttt{apply\_error} & The repair could not be meaningfully tested: a dataset join failure, an invalid repair-proposal record, a clone or checkout failure, a Docker build failure, a failed fix installation, a timeout, or a missing output notebook. \\
+    \hline
+  \end{tabular}
+  \caption{FixApplicator outcome values.}
+  \label{tab:m-outcomes}
+\end{table}
+
+A \texttt{still\_failing} result additionally records whether the new error
+is the same as the original one, using a conservative check: it is only
+ever marked the same when both the exception type matches \emph{and} the
+original failing module name still appears in the new message. This check
+is designed to under-claim sameness rather than over-claim it, so that a
+result is never wrongly reported as "the fix did nothing" when it actually
+resolved the original problem and simply uncovered a different one. This
+distinction turns out to matter a great deal in practice, as
+\Cref{chap:validation} shows.
+
+A row whose proposal was \texttt{"none"}, or whose upstream status was not
+\texttt{"success"}, is not treated as an attempt at all. It is recorded with
+a separate \texttt{status: "skipped"} field rather than invented as a
+fourth outcome value, keeping the three-value contract intact while still
+distinguishing "nothing was attempted" from "an attempt was made and
+failed."
+
+\subsection{What Real Execution Revealed That Mocked Tests Could Not}
+\label{sec:m-fixapply-bugs}
+
+The mocked, offline test suite for this component was already fully passing
+before it was ever run against a real Docker daemon. Running it for real
+nonetheless surfaced three environment-specific bugs that no amount of
+mocked testing could have caught, because each one depends on exact runtime
+behaviour that a mock necessarily replaces with an assumption:
+
+\begin{itemize}
+  \item \textbf{A locale-dependent crash while reading container output.}
+        Captured subprocess output was decoded using the host machine's
+        default text encoding, which silently failed on legitimate progress
+        output from pip, git, and Docker and lost the entire container log
+        on the very first real attempt. Fixed by decoding output as UTF-8
+        explicitly, substituting any undecodable byte rather than crashing.
+  \item \textbf{A corrupted script on Windows.} Writing the generated
+        container entry-point script through a normal text write silently
+        converted its line endings, which broke the script's first line (its
+        shebang) so that Docker could not run it at all. Fixed by writing
+        that file with explicit Unix-style line endings.
+  \item \textbf{Leftover work directories after cleanup.} A real
+        \texttt{git clone} on Windows leaves some files read-only, and the
+        directory-removal call used during cleanup silently skipped its own
+        error-handling logic whenever it was told to ignore errors, so
+        read-only files were never actually removed. Fixed by handling
+        removal errors explicitly instead of asking the cleanup call to
+        ignore them.
+\end{itemize}
+
+All three are now covered by dedicated regression tests. They are recorded
+here as a methodological point, not only a bug list: a mocked test suite
+can prove that a component's logic is internally consistent, but it cannot
+prove that the component behaves correctly against a real operating system,
+a real Docker daemon, and real subprocess output. The real pilot described
+in \Cref{chap:validation} was necessary precisely because of this gap.
+
+\subsection{Environment Isolation and What Is Out of Scope}
+
+Every attempt uses a freshly named work directory and container, and both
+are always removed afterwards regardless of whether the attempt succeeded,
+failed, or timed out. A rebuilt Docker image being reused across attempts
+(through Docker's own build cache) is expected and is not a sign that
+isolation failed -- the guarantee that matters is a fresh clone and a fresh
+container per attempt, not a fresh image layer every time.
+
+FixApplicator itself has no orchestrator and no two-round feedback loop, and
+it does not persist its results to a database or knowledge graph -- that is
+handled separately by ResultLogger (\Cref{sec:m-resultlogger}). FixApplicator
+returns one self-contained result per attempt.
+
+% TODO-FULL-RUN: update after full orchestrated dataset execution and completion of the bounded second repair round
+\fullrunupdate{ResultLogger is implemented and validated at pilot scale, not
+yet run over the complete dataset. Wiring many such attempts into an
+unattended batch run and feeding a \texttt{still\_failing} result back into
+RAGRepairAgent for a second attempt remain explicitly future work
+(\Cref{chap:future-work}).}
+
+\section{Result Logging and Knowledge-Graph Enrichment}
+\label{sec:m-resultlogger}
+
+ResultLogger (\Cref{subsec:resultlogger}) classifies nothing, explains
+nothing, proposes nothing, and applies nothing. Its only job is to bring
+together what the four preceding components already wrote to their own
+JSONL output files -- one file per component, one record per notebook or
+attempt -- into a single, persistent \texttt{repair\_attempts} row, and then
+to make that row queryable as RDF as well as SQL.
+\texttt{scripts/result\_logger.py} implements the SQLite side of this;
+\texttt{scripts/export\_repair\_attempts\_csv.py} and
+\texttt{mapping/rml\_mapping/repair\_attempts.rml.ttl} implement the
+knowledge-graph side.
+
+\subsection{Joining Four Outputs That Do Not Share One Join Key}
+\label{sec:m-resultlogger-join}
+
+RAGRepairAgent's repair-proposal file is the driving input: ResultLogger
+produces exactly one \texttt{repair\_attempts} row per line of the given
+file, in file order, and nothing else determines how many rows a run
+produces. This is possible because RAGRepairAgent itself already runs over
+every classified row, not only the repair-eligible ones -- an excluded or
+invalid row still receives a record, it simply abstains with
+\texttt{final\_action: "none"} and no PyPI or model call
+(\Cref{sec:m-repair}) -- so a repair-proposal file that covers the whole
+dataset already has one entry per notebook per experimental configuration,
+matching the table's own contract that one row represents one attempt, not
+one notebook.
+
+The remaining three inputs are each joined to that driving record with a
+different strategy, because the real data does not allow one uniform key
+across all of them:
+
+\begin{itemize}
+  \item \textbf{The classification dataset} is the required base context.
+        Every repair-proposal record's \texttt{notebook\_execution\_id}
+        must resolve against it (reusing
+        \texttt{fix\_applicator.load\_i2\_index()}, the same loader
+        FixApplicator already uses for its own re-join,
+        \Cref{sec:m-fixapply}); a miss is a hard error, never a guess,
+        matching how FixApplicator already treats the same situation.
+  \item \textbf{The explanation output} is joined by
+        \texttt{notebook\_execution\_id}. This is safe because a coherent
+        explanation run produces at most one record per notebook; the
+        loader raises a dedicated \texttt{AmbiguousExplanationError} rather
+        than silently keeping the first or last match if it ever finds two
+        explanation records for the same id in one file.
+  \item \textbf{The fix-application output}, optional, is joined by
+        \emph{position}, not by \texttt{notebook\_\allowbreak execution\_id}.
+        \texttt{scripts/fix\_applicator.py} already stamps every result it
+        writes with the 0-based line index of the repair-proposal file it
+        processed; ResultLogger reuses that same index to find the matching
+        outcome, if any, for a given proposal.
+\end{itemize}
+
+This positional join between the repair-proposal and fix-application
+outputs is not a stylistic choice -- it is required by a real case already
+in the dataset. \texttt{notebook\_execution\_id} can legitimately repeat
+across separate repair-proposal lines: the real pilot file
+\texttt{data/repair-proposals/i4\_live\_pilot.jsonl} used in
+\Cref{sec:v-i4} contains exactly this, a timed-out attempt at
+\texttt{notebook\_execution\_id=8} followed by a later, successful re-run of
+the same notebook. Joining by id alone would leave it ambiguous which of the
+two fix-application outcomes belongs to which proposal; joining by line
+position is not. Because ResultLogger produces one row per proposal-file
+line regardless, this case yields two distinct \texttt{repair\_attempts}
+rows rather than being collapsed or cross-matched -- exactly the behaviour
+\Cref{subsec:repair-table} already requires of the table, now confirmed by
+a real, not merely hypothetical, duplicate.
+
+\subsection{Building One Row}
+\label{sec:m-resultlogger-row}
+
+\texttt{build\_repair\_attempt\_row()} fills the eighteen columns fixed in
+\Cref{subsec:repair-table} from these four inputs. \texttt{failing\_module}
+and \texttt{subtype} come from the classification dataset;
+\texttt{explanation}, \texttt{llm\_model}, and \texttt{prompt\_strategy}
+come from the explanation output, when a record exists for that notebook.
+The remaining fields follow one rule: when a matching fix-application
+record exists, \texttt{action}, \texttt{install\_name}, \texttt{version},
+\texttt{command}, \texttt{outcome}, the new-error fields, \texttt{run\_id},
+and \texttt{created\_at} all come from that record, since it reflects what
+was actually applied and observed; when no such record exists -- an
+abstained or failed repair proposal, or one simply not yet run through
+FixApplicator -- these same fields fall back to the repair proposal's own
+\texttt{final\_action}, \texttt{final\_install\_name},
+\texttt{final\_version}, \texttt{command}, \texttt{run\_id}, and
+\texttt{created\_at}, with \texttt{outcome} and the new-error fields left
+\texttt{NULL} rather than guessed. One field breaks this pattern
+deliberately: \texttt{rationale} always comes from the repair proposal's own
+\texttt{final\_rationale}, whether or not a fix-application record exists,
+because FixApplicator explains no repair decision of its own -- it only
+executes and classifies a decision RAGRepairAgent already made and
+justified.
+
+This \texttt{run\_id}/\texttt{created\_at} fallback means the field does not
+always mean the same thing across rows: for a row with an outcome, it names
+the FixApplicator run that produced it; for a row without one, it names the
+RAGRepairAgent run instead. This distinction is made explicit here rather
+than left implicit in a uniform-looking column, because most repair-proposal
+records never reach FixApplicator at all, and the architecture's own
+component diagram (\Cref{fig:architecture-components}) already expects an
+abstained or failed attempt to be logged regardless. None of the earlier
+components were changed to accept a shared, externally supplied
+\texttt{run\_id} for this -- each still mints its own per invocation; a
+single orchestration-level run identifier threaded through every stage of
+one pipeline pass is left to full pipeline orchestration
+(\Cref{chap:future-work}), once it actually calls every stage in sequence
+within one pass.
+
+\subsection{Preserving Structured Evidence Instead of Flattening It}
+\label{sec:m-resultlogger-json}
+
+Two of the eighteen columns intentionally hold a serialized JSON document
+rather than a single reduced value. The complete explanation object --
+its \texttt{summary}, \texttt{root\_cause}, \texttt{evidence} list,
+\texttt{explanation\_confidence}, and \texttt{limitations}, exactly as
+validated against \texttt{schemas/explanation.schema.json}
+(\Cref{sec:m-explanation-deviation}) -- is written whole into the
+\texttt{explanation} column, not reduced to its \texttt{summary} field
+alone. The complete \texttt{retrieval\_result} object produced by
+RAGRepairAgent -- the resolved distribution name, every candidate version
+considered, the compatibility evidence and its source citation where one
+was used, and any warning raised during retrieval -- is written whole into
+\texttt{pypi\_evidence}, not the smaller three-field illustration shown in
+\Cref{subsec:fix-object}. Both columns are \texttt{NULL}, never an empty
+string or an empty JSON object, when the corresponding upstream record does
+not exist or carries no value at all -- an abstained proposal, for
+instance, has no \texttt{retrieval\_result} to serialize.
+
+This preserves detail a later evaluation might need without forcing it back
+to the original explanation and repair-proposal files, which the batch that
+produced them may not even have kept: a candidate version PyPI offered but
+the model did not choose, or a compatibility source the model's proposal
+relied on, remains readable directly from the row that used it, as evidence
+and as provenance, rather than only as an unrecoverable intermediate step.
+
+\subsection{From SQLite to CSV: Reusing the Existing KG Tooling}
+\label{sec:m-resultlogger-csv}
+
+SQLite remains the actual store of record for evaluation and provenance;
+\texttt{scripts/\allowbreak export\_repair\_attempts\_csv.py} adds a CSV export
+purely because the existing FAIR Jupyter knowledge-graph mappings
+(\texttt{mapping/rml\_mapping/*.rml.ttl}, including
+\texttt{executions.rml.ttl}) all read a CSV file through Morph-KGC's
+\texttt{ql:CSV} logical source, never a live database connection. The CSV
+is a bridge to that existing tooling's expectation, not a replacement for the
+table it is exported from.
+
+\texttt{repair\_attempts} itself stores only \texttt{notebook\_execution\_id}
+(\Cref{subsec:repair-table}), but the knowledge graph identifies a notebook
+by \texttt{notebook\_id}. The exporter resolves \texttt{notebook\_id} per row
+by re-joining \texttt{notebook\_execution\_id} against the same
+classification dataset ResultLogger itself requires, using the same
+\texttt{load\_i2\_index()} loader FixApplicator already established for
+exactly this kind of recovery (\Cref{sec:m-fixapply}). A
+\texttt{notebook\_execution\_id} missing from the given dataset raises an
+error naming the offending \texttt{repair\_attempts.id}, rather than
+exporting a row with no notebook link -- a case that, by construction,
+should never arise, since \texttt{log\_repair\_attempts()} already required
+every id it logged to resolve against that same dataset. The exported
+columns are \texttt{id} and \texttt{notebook\_id}, followed by all eighteen
+\texttt{repair\_attempts} columns unchanged; \texttt{notebook\_execution\_id}
+is carried into the CSV for traceability even though the mapping below does
+not reference it directly.
+
+\subsection{The RML Mapping}
+\label{sec:m-resultlogger-rml}
+
+\texttt{mapping/rml\_mapping/\allowbreak repair\_attempts.rml.ttl} is modelled
+directly on the existing \texttt{executions.rml.ttl} -- the same prefix
+block, the same \texttt{rr:TriplesMap}/\allowbreak\texttt{rr:PredicateObjectMap}
+structure -- and defines two triples maps over the exported CSV.
+
+The first gives each repair attempt an IRI,
+\url{https://w3id.org/reproduceme/repairattempt_{id}}, typed both
+\texttt{repr:RepairAttempt} and \texttt{prov:Activity}, matching the
+vocabulary strategy fixed at design time (\Cref{subsec:kg}): reuse an
+existing term where one already fits, add a new \texttt{repr:} term
+otherwise. The failing module, subtype, explanation, and every field of the
+proposed fix and its outcome are attached to this IRI as literal
+properties, each mapped to its own new \texttt{repr:} predicate:
+
+\begin{center}
+\small
+\begin{tabular}{ll@{\hspace{1.5cm}}ll}
+\texttt{failing\_module} & \texttt{repr:failingModule} &
+  \texttt{pypi\_evidence} & \texttt{repr:pypiEvidence} \\
+\texttt{subtype} & \texttt{repr:subtype} &
+  \texttt{outcome} & \texttt{repr:fixOutcome} \\
+\texttt{explanation} & \texttt{repr:explanation} &
+  \texttt{llm\_model} & \texttt{repr:llmModel} \\
+\texttt{action} & \texttt{repr:fixAction} &
+  \texttt{prompt\_strategy} & \texttt{repr:promptStrategy} \\
+\texttt{install\_name} & \texttt{repr:installName} &
+  \texttt{round} & \texttt{repr:round} \\
+\texttt{version} & \texttt{repr:fixVersion} &
+  \texttt{run\_id} & \texttt{repr:runId} \\
+\texttt{command} & \texttt{repr:fixCommand} & & \\
+\texttt{rationale} & \texttt{repr:fixRationale} & & \\
+\end{tabular}
+\end{center}
+
+Two further fields reuse predicates
+\texttt{executions.rml.ttl} already defines for a \texttt{CellExecution}'s
+own exception and message, rather than minting new ones: \texttt{new\_error\_type}
+maps to \texttt{repr:exception} and \texttt{new\_error\_message} to
+\texttt{repr:msg}. These describe the \emph{post-repair} error, not the
+original one -- the original failure's own \texttt{repr:exception}/
+\texttt{repr:msg} triple already exists elsewhere in the graph, written by
+the existing executions mapping, so this is the same kind of fact reused for
+a second observation of it, not a duplicate of the first. Finally,
+\texttt{created\_at} maps to \texttt{prov:endedAtTime}, explicitly typed
+\texttt{xsd:dateTime} -- the one place this mapping departs from the
+untyped-literal style the rest of the graph uses, because PROV-O's own
+specification gives \texttt{prov:endedAtTime} an \texttt{xsd:dateTime} range
+and the \texttt{created\_at} values are already ISO-8601 strings.
+
+A column that is \texttt{NULL} in \texttt{repair\_attempts} -- an abstained
+attempt's \texttt{install\_name}, or any row with no recorded
+\texttt{outcome} yet -- becomes an empty field in the exported CSV, and
+Morph-KGC generates no triple at all for the corresponding predicate on that
+row, never an empty-string literal. Missing evidence is therefore absent
+from the graph rather than misrepresented as an observed empty value.
+
+The second triples map links the notebook to this repair attempt. Its
+subject template, \url{https://w3id.org/reproduceme/notebook_{notebook_id}},
+is byte-for-byte the same shape \texttt{notebooks.rml.ttl} already uses for
+its own subject, so the two resolve to the same node once loaded into the
+same graph -- no join, and no edit to the existing mapping, is required. The
+one triple this map emits is
+\texttt{repr:hadRepairAttempt} \texttt{repr:repairattempt\_\{id\}}, attaching
+the repair history to a notebook resource the graph already contains.
+
+\subsection{Notebook Identity: Why No Crosswalk Table Is Needed}
+\label{sec:m-resultlogger-identity}
+
+The link above only makes sense if the Docker pipeline's own
+\texttt{notebook\_id} genuinely identifies the same notebook as the existing
+FAIR Jupyter knowledge graph's own \texttt{notebook\_id} -- a graph generated
+from the earlier, conda-based pipeline (\Cref{sec:pd-why-docker}), not the
+Docker pipeline this thesis builds on. Whether the two pipelines' identifiers
+actually coincide was, at the point this mapping was designed, an open
+question rather than an assumption, and it was resolved by checking, not by
+assuming: \Cref{sec:v-i6} reports the check and its result. Because the two
+were confirmed to share the same \texttt{notebook}/\texttt{repository}
+primary keys for the dataset this thesis operates on, the mapping above links
+a repair attempt straight to its existing notebook resource via
+\texttt{notebook\_id}, with no separate crosswalk table between the Docker
+pipeline and the knowledge graph.
+
+\section{A Worked Example: One Record Through the Pipeline}
+\label{sec:m-worked-example}
+
+The preceding sections describe each component on its own terms. This
+section traces one real record through every implemented stage, to make the
+resulting data flow concrete. All values shown are taken from the committed
+pilot artefacts already referenced above and in \Cref{chap:validation}
+(\texttt{data/context-classification/\allowbreak dependency\_error\_contexts.jsonl},
+\texttt{data/repair-proposals/\allowbreak i4\_live\_pilot.jsonl}, and the real-Docker
+validation reported in \Cref{sec:v-i5}); none of the values below were
+invented for illustration. The chosen record is
+\texttt{notebook\_execution\_id}~174, the \texttt{scipy}/\texttt{cumtrapz}
+case already introduced in \Cref{tab:m-compat,sec:v-i4,sec:v-i5}.
+
+\paragraph{1. Classification.} The notebook
+\texttt{examples/notebooks/Molten\_Salt\_Comparison.ipynb} in
+\texttt{zincware/MDSuite} fails with
+\texttt{ImportError: cannot import name 'cumtrapz' from}
+\texttt{'scipy.integrate'}. Dataset preparation and context extraction
+record \texttt{failing\_module: "scipy"}, \texttt{refined\_subtype:
+"wrong\_version"}, \texttt{scope\_status: "usable"},
+\texttt{root\_cause\_hint: "version\_or\_api\_incompatibility"}, and
+confidence \texttt{"high"}.
+
+\paragraph{2. Explanation.} No explanation record exists for this specific
+notebook in the committed pilot output; \Cref{sec:m-explanation-example}
+shows a real explanation record for a different pilot notebook
+(\texttt{notebook\_execution\_id}~8), illustrating the schema this record's
+explanation would follow once generated.
+
+\paragraph{3. Retrieval.} RAGRepairAgent resolves \texttt{scipy} to itself
+(no name mapping needed) and retrieves five Python-3.10-compatible
+candidates from the real PyPI Simple API: 1.13.1, 1.13.0, 1.12.0, 1.11.4,
+and 1.11.3. Because the subtype is \texttt{wrong\_version}, the
+compatibility-evidence registry (\Cref{tab:m-compat}) is also consulted and
+resolves \texttt{compatible\_\allowbreak specifier: "<1.14.0"}, citing the SciPy 1.14.0
+release notes' "Expired deprecations" entry for \texttt{cumtrapz}.
+
+\paragraph{4. Repair proposal.} Intersecting the candidate list with the
+compatibility constraint, the model proposes \texttt{action: "pin\_version"},
+\texttt{install\_name: "scipy"}, \texttt{version: "1.13.1"}, with rationale
+"cumtrapz was removed in SciPy 1.14.0; 1.13.1 is the newest candidate
+version below that boundary, confirmed Python-3.10-compatible." Both schema
+and grounding validation pass on the first attempt, and the command is
+built deterministically as \texttt{python -m pip install scipy==1.13.1}.
+
+\paragraph{5. Fix application.} FixApplicator re-joins the record to recover
+its repository and commit
+(\texttt{eadda45f96874bd6d7eacba89c57daba76db1c7d}), rebuilds the Docker
+environment, installs a real \texttt{requirements.txt} and one
+\texttt{setup.py} package, then applies the pin. Installation succeeds, and
+the notebook is re-executed top to bottom.
+
+\paragraph{6. Observed result.} The original \texttt{cumtrapz} import error
+is gone, and execution proceeds further into the notebook -- direct
+evidence that the version pin resolved the targeted incompatibility. The
+notebook then fails again on an unrelated
+\texttt{ModuleNotFoundError: No module named 'tf\_keras'}. The conservative
+\texttt{same\_as\_original\_error} check correctly marks this as
+\texttt{false}: a different problem, not evidence that the fix did not
+work. This is precisely the pattern \Cref{sec:v-key-observation} discusses
+at the level of the whole pilot: repairing one dependency can reveal
+another, and this notebook has not been made fully runnable by this single
+attempt.
+
+\paragraph{7. Result logging.} Applying the join logic of
+\Cref{sec:m-resultlogger-row} to this record's classification, proposal, and
+outcome yields one \texttt{repair\_attempts} row:
+\texttt{failing\_module: "scipy"}, \texttt{subtype: "wrong\_version"},
+\texttt{action: "pin\_version"}, \texttt{install\_name: "scipy"},
+\texttt{version: "1.13.1"}, \texttt{outcome: "still\_failing"},
+\texttt{new\_error\_type: "ModuleNotFoundError"},
+\texttt{new\_error\_message: "No module named 'tf\_keras'"}, and
+\texttt{round: 1}. Because a matching fix-application record exists,
+\texttt{run\_id} and \texttt{created\_at} are taken from that FixApplicator
+run, as described above. This specific row has not itself been executed
+through a committed ResultLogger run -- the mapping's own pilot validation
+(\Cref{sec:v-i6}) exercised a different combination of records -- so it is
+shown here as the direct, mechanical result of the documented join logic
+applied to this record's own already-validated outputs, not as a row
+already sitting in the database.
+
+\paragraph{8. Knowledge-graph link.} Exporting this row and running it
+through \texttt{repair\_attempts.\allowbreak rml.ttl} attaches it to the existing
+notebook resource for \texttt{notebook\_id}~428 (the notebook's real,
+confirmed identifier, \Cref{sec:m-resultlogger-identity}):
+
+\begin{quote}
+\small
+\texttt{repr:notebook\_428 repr:hadRepairAttempt repr:repairattempt\_\{id\}} .\\[2pt]
+\texttt{repr:repairattempt\_\{id\} a repr:RepairAttempt, prov:Activity} ;\\
+\texttt{\ \ repr:failingModule "scipy" ;}\\
+\texttt{\ \ repr:fixAction "pin\_version" ;}\\
+\texttt{\ \ repr:fixVersion "1.13.1" ;}\\
+\texttt{\ \ repr:fixOutcome "still\_failing" ;}\\
+\texttt{\ \ repr:exception "ModuleNotFoundError" ;}\\
+\texttt{\ \ repr:msg "No module named 'tf\_keras'" .}
+\end{quote}
+
+The \texttt{\{id\}} placeholder is left as a template, as in
+\Cref{sec:m-resultlogger-rml}, because this row has not been assigned a real
+primary key by an actual insert. This one worked example does not represent
+a repair success -- it represents exactly what \Cref{sec:v-key-observation}
+already establishes across the whole pilot: the implemented chain correctly
+carries a dependency failure through explanation, grounded repair,
+re-execution, and structured logging, and correctly records that this
+notebook required more than the one repair attempted here.
+
+\section{Design Decisions at a Glance}
+\label{sec:m-decisions}
+
+The preceding sections explain the reasoning behind each decision in place,
+close to the component it affects. \Cref{tab:m-decisions-a,tab:m-decisions-b}
+collect the most significant decisions in one place for reference, grouped
+by the part of the system they belong to, including several where the final
+choice only emerged after an initial assumption met a concrete problem
+during implementation.
+
+\begin{table}[h]
+  \centering
+  \begin{tabular}{|p{3.6cm}|p{9.7cm}|}
+    \hline
+    \textbf{Decision} & \textbf{Reasoning} \\
+    \hline
+    Docker pipeline, not the conda run, as integration target &
+      Its residual failures, left over after containerisation, are a
+      cleaner and more targeted dependency signal (\Cref{sec:pd-why-docker}). \\
+    \hline
+    Scope limited to \texttt{Module\allowbreak NotFound\allowbreak Error} /
+    \texttt{ImportError} &
+      These are exactly what the upstream pipeline already tags as
+      dependency-related; no new detection logic was needed. \\
+    \hline
+    pip-only repair actions for v1 &
+      Keeps the first version controlled and measurable; system-level and
+      source-code repairs are a separate, larger problem (\Cref{sec:pd-scope}). \\
+    \hline
+    Deterministic classification before any LLM call &
+      A decision that gates automated repair should be auditable and
+      reproducible, not dependent on a model's judgement (\Cref{sec:m-dataset}). \\
+    \hline
+    Local, open model (Gemma-2 9B via Ollama) &
+      Matches PLLM's own best configuration and keeps the system
+      cost-free and privacy-preserving to run (\Cref{sec:m-explanation}). \\
+    \hline
+    Explanation output changed from prose to strict JSON &
+      \emph{Initial:} free-form prose. \emph{Problem:} an automated
+      pipeline needs machine-checkable, loggable output. \emph{Final:}
+      schema-validated JSON with one retry (\Cref{sec:m-explanation-deviation}). \\
+    \hline
+    Repair command never written by the model &
+      \emph{Initial:} the model returned a command string directly.
+      \emph{Problem:} this lets free-text output reach a field later run as
+      a subprocess. \emph{Final:} the model proposes only structured values;
+      the command is built deterministically after validation. \\
+    \hline
+    PyPI JSON Simple API, not the project JSON \texttt{releases} field &
+      PyPI's own documentation marks \texttt{releases} as deprecated for
+      new integrations (\Cref{sec:m-repair-retrieval}). \\
+    \hline
+    Explicit import-to-distribution mapping table &
+      An import name is not always its own PyPI package name; guessing
+      identity would misresolve common cases such as \texttt{sklearn}. \\
+    \hline
+    Curated compatibility-evidence registry &
+      PyPI metadata cannot prove a specific symbol exists in a release;
+      letting the model guess a historical version would be unfounded
+      (\Cref{sec:m-repair-compat}). \\
+    \hline
+    Procedural pipeline, not an autonomous agent &
+      Agentic frameworks add latency and control overhead that scale
+      poorly across hundreds of independent, mostly single-dependency
+      failures~\cite{yang2025aprsurvey}. \\
+    \hline
+  \end{tabular}
+  \caption{Design decisions for dataset preparation, classification,
+           explanation, and repair generation.}
+  \label{tab:m-decisions-a}
+\end{table}
+
+\begin{table}[h]
+  \centering
+  \begin{tabular}{|p{3.6cm}|p{9.7cm}|}
+    \hline
+    \textbf{Decision} & \textbf{Reasoning} \\
+    \hline
+    Docker environment reconstructed, not reused &
+      \emph{Initial assumption:} FixApplicator attaches to the original
+      container. \emph{Problem discovered:} the original containers were
+      never preserved. \emph{Final:} an equivalent environment is rebuilt
+      from the same recipe on every attempt (\Cref{sec:m-fixapply-docker}). \\
+    \hline
+    Re-join by \texttt{notebook\_\allowbreak execution\_\allowbreak id} &
+      \emph{Problem discovered:} the repair-proposal record does not carry
+      repository or notebook identity forward. \emph{Final:} FixApplicator
+      recovers it by joining back to the classification dataset before
+      doing anything else. \\
+    \hline
+    Repository commit pinning &
+      Prevents a later repair attempt from silently testing against a
+      different revision of a public repository than the one that
+      originally failed. \\
+    \hline
+    Full top-to-bottom re-execution &
+      A notebook keeps state across cells; a partial re-run from the
+      failing cell cannot prove a fix works~\cite{grotov2024debug}. \\
+    \hline
+    Bounded retries and bounded rounds, never unlimited &
+      Applies uniformly across the explanation retry, the repair retry, the
+      PyPI rate-limit retry, and the planned two-round repair mode -- a
+      slow or unavailable external system must degrade to a clean failure,
+      never an unbounded wait. \\
+    \hline
+    Positional, not id-based, join in ResultLogger &
+      \texttt{notebook\_execution\_id} can legitimately repeat across
+      separate attempts at the same notebook; FixApplicator's own
+      line-index stamp identifies which attempt each fix-application record
+      belongs to unambiguously (\Cref{sec:m-resultlogger-join}). \\
+    \hline
+    Structured explanation and PyPI evidence preserved as JSON, not flattened &
+      Reducing the explanation or retrieval evidence to a single summary
+      field at logging time would permanently discard detail a later
+      evaluation might need; both are serialized whole into a TEXT column
+      instead (\Cref{sec:m-resultlogger-json}). \\
+    \hline
+    CSV export as a bridge to the existing KG tooling, not a replacement for SQLite &
+      Every existing FAIR Jupyter knowledge-graph mapping reads a CSV file
+      through Morph-KGC's \texttt{ql:CSV} logical source, never a live
+      database connection; SQLite remains the actual store of record
+      (\Cref{sec:m-resultlogger-csv}). \\
+    \hline
+  \end{tabular}
+  \caption{Design decisions for fix application, result logging, and
+           knowledge-graph provenance.}
+  \label{tab:m-decisions-b}
+\end{table}

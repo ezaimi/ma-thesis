@@ -228,6 +228,26 @@ framing. Full detail and rationale in `docs/fix-applicator.md`.
   pipeline itself - checks out each repository's recorded commit when the upstream pipeline's own DB
   has one, since the original pipeline's own clone step does not pin to it.
 
+### 7.3 ResultLogger `run_id` fallback (i6 refinement)
+
+`scripts/result_logger.py` (i6, Part 1) joins one `repair_attempts` row per `RAGRepairAgent` (i4)
+record, matched to its `FixApplicator` (i5) outcome by position (the `index` field i5 stamps on
+each result is the line number of the i4 file it processed - not `notebook_execution_id`, which
+i4 can legitimately repeat across separate attempts at the same notebook). Most i4 records never
+reach i5 at all: an excluded row abstains, a failed LLM call produces no fix, and any row not yet
+run through `FixApplicator` simply has no outcome yet. The architecture's own component diagram
+(§5) still expects these to be logged - `LLMExplainer`'s output reaches `ResultLogger` for every
+row, independent of repair eligibility.
+
+**Decision:** when a repair attempt has no matching i5 record, `repair_attempts.run_id` (and
+`created_at`) fall back to the i4 record's own `run_id`/`created_at` instead of being left `NULL`.
+This keeps every i4 attempt logged and traceable to the run that produced it, at the cost of
+`run_id` not always meaning "the FixApplicator run" - for a row with no `outcome`, it means "the
+RAGRepairAgent run" instead. i3/i4/i5 are unchanged; none of them accept a shared, externally
+supplied `run_id` today; each mints its own per CLI invocation. Threading one orchestration-level
+`run_id` through all three stages is left to i7's orchestrator, once it actually calls them in
+sequence within one pass.
+
 ---
 
 ## 8. Mapping to thesis objectives
@@ -237,9 +257,9 @@ framing. Full detail and rationale in `docs/fix-applicator.md`.
 | O1 — Error explanation | LLMExplainer | designed |
 | O2 — Fix generation (PyPI RAG) | RAGRepairAgent + fix object (§6.1) | implemented (i4): `scripts/rag_repair_agent.py`, `scripts/pypi_retriever.py`, `scripts/compatibility_evidence.py` produce a validated, grounded fix object |
 | O3 — Fix validation | FixApplicator (re-run in container) | implemented (i5): `scripts/fix_applicator.py`, `scripts/docker_runner.py`, `scripts/notebook_outcome.py` apply a fix and re-run the notebook inside a rebuilt Docker environment; see §7.2 and `docs/fix-applicator.md` for the deviations this required from the design below |
-| O4 — Benchmark dataset | `repair_attempts` table (§6.2) | schema designed |
+| O4 — Benchmark dataset | `repair_attempts` table (§6.2) | implemented and pilot-validated (i6): `scripts/result_logger.py` joins i2/i3/i4/i5 into the table; full-dataset population is future work (§10 of `docs/result-logger.md`) |
 | O5 — Pipeline integration | orchestrator + hook-in (§3, §5) | designed |
-| O6 — KG enrichment | `repair_attempts.rml.ttl` (§6.3) | designed |
+| O6 — KG enrichment | `repair_attempts.rml.ttl` (§6.3) | implemented and pilot-validated (i6): `scripts/export_repair_attempts_csv.py` + `mapping/rml_mapping/repair_attempts.rml.ttl` produce valid RDF linked to the existing FAIR Jupyter KG notebook nodes; full KG population is future work (`docs/result-logger.md`) |
 
 ---
 
